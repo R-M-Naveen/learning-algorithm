@@ -1,0 +1,122 @@
+// Lessons: distilled from scored trajectories, reinforced on repetition,
+// ranked at retrieval. Pure — the store applies these functions to rows.
+//
+// Deterministic distillation only, for now: lesson text comes from templates
+// keyed on reward signals, so the same behavior always yields the same
+// lesson with the same id — which is exactly what reinforcement keys on.
+// The judge (M4/M5) will add distillation with free-text lessons; those ride
+// the same reinforce/rank machinery.
+import { createHash } from "node:crypto";
+import type { LearningEvent } from "./events.ts";
+import type { DeterministicScore } from "./rewards.ts";
+import type { TaskRow, LessonRow } from "../store/db.ts";
+
+export type CandidateLesson = {
+  /** hash(contextKey + text): identical lessons collide on purpose. */
+  id: string;
+  contextKey: string;
+  /** basename of the task cwd; null when unknown. */
+  repoKey: string | null;
+  lesson: string;
+  polarity: "do" | "avoid";
+};
+
+/** Signal key → lesson template. Positive templates require a positive
+ *  trajectory (a "do" from a failed task is noise); avoid-templates and the
+ *  safety template distill regardless of outcome. */
+const DO_TEMPLATES: Record<string, string> = {
+  test_pass_after_edit:
+    "Reproduce the failing test first, read the relevant source, make a focused edit, then verify with the same targeted test.",
+  focused_edit: "Keep edits to the few files the task actually needs.",
+};
+
+const AVOID_TEMPLATES: Record<string, string> = {
+  repeated_failed_command:
+    "If a command fails, do not re-run it unchanged — gather new information before retrying.",
+  broad_edit: "Avoid touching many files for a single fix; prefer a small focused diff.",
+  approval_decline:
+    "An action of this shape was declined by the user; prefer a narrower alternative or ask first.",
+};
+
+const SAFETY_TEMPLATES: Record<string, string> = {
+  test_deletion: "Never delete or weaken tests to make the suite pass.",
+};
+
+export function lessonId(contextKey: string, lesson: string): string {
+  return createHash("sha256").update(`${contextKey}\n${lesson}`).digest("hex").slice(0, 16);
+}
+
+export function repoKeyOf(cwd: string | null | undefined): string | null {
+  if (!cwd) return null;
+  const base = cwd.replace(/\/+$/, "").split("/").pop();
+  return base || null;
+}
+
+export function distillLessons(
+  task: TaskRow & { taskType?: string | null },
+  _events: LearningEvent[],
+  score: DeterministicScore,
+): CandidateLesson[] {
+  const contextKey = task.taskType ?? "general";
+  const repoKey = repoKeyOf(task.cwd);
+  const present = new Set(score.signals.map((s) => s.key));
+  const out: CandidateLesson[] = [];
+  const push = (lesson: string, polarity: "do" | "avoid") =>
+    out.push({ id: lessonId(contextKey, lesson), contextKey, repoKey, lesson, polarity });
+
+  for (const [signal, text] of Object.entries(SAFETY_TEMPLATES)) {
+    if (present.has(signal)) push(text, "avoid");
+  }
+  for (const [signal, text] of Object.entries(AVOID_TEMPLATES)) {
+    if (present.has(signal)) push(text, "avoid");
+  }
+  if (score.total > 0) {
+    for (const [signal, text] of Object.entries(DO_TEMPLATES)) {
+      if (present.has(signal)) push(text, "do");
+    }
+  }
+  return out;
+}
+
+// ── Reinforcement ────────────────────────────────────────────────────────
+
+export type ReinforceInput = { taskReward: number };
+export type ReinforcedValues = { confidence: number; supportCount: number; avgReward: number | null };
+
+const FRESH_CONFIDENCE = 0.4;
+/** Each repeat closes this fraction of the gap to 1 — asymptotic, never 1. */
+const CONFIDENCE_STEP = 0.15;
+
+export function reinforce(existing: ReinforcedValues | null, input: ReinforceInput): ReinforcedValues {
+  if (!existing) {
+    return { confidence: FRESH_CONFIDENCE, supportCount: 1, avgReward: input.taskReward };
+  }
+  const supportCount = existing.supportCount + 1;
+  const confidence = existing.confidence + (1 - existing.confidence) * CONFIDENCE_STEP;
+  const prevAvg = existing.avgReward ?? 0;
+  const avgReward = prevAvg + (input.taskReward - prevAvg) / supportCount;
+  return { confidence, supportCount, avgReward };
+}
+
+// ── Retrieval ranking ────────────────────────────────────────────────────
+
+export type RankOptions = { repoKey?: string | null };
+export type RankedLesson = LessonRow & { score: number; finalScore: number };
+
+/** Combine FTS relevance with what reinforcement has learned. Text relevance
+ *  carries the most weight; support enters logarithmically so frequency can
+ *  never drown topicality; same-repo lessons get a fixed affinity bonus.
+ *  Recency is deliberately absent for now — it would make ranking
+ *  time-dependent, and with it every test. */
+export function rankLessons(hits: (LessonRow & { score: number })[], opts: RankOptions): RankedLesson[] {
+  return hits
+    .map((h) => ({
+      ...h,
+      finalScore:
+        h.score +
+        0.5 * h.confidence +
+        0.2 * Math.log1p(h.supportCount) +
+        (opts.repoKey && h.repoKey === opts.repoKey ? 0.3 : 0),
+    }))
+    .sort((a, b) => b.finalScore - a.finalScore);
+}

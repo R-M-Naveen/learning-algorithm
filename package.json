@@ -1,0 +1,21 @@
+{
+  "name": "learning-algorithm",
+  "version": "0.1.0",
+  "description": "Local learning sidecar for the Unbiased desktop app: records agent trajectories, scores outcomes, distills lessons, serves them back.",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "conformance": "node --import tsx conformance/run.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
