@@ -99,6 +99,24 @@ check(
   res(bogus)?.ok === false && res(bogus)?.reason === "unknown_lesson",
 );
 
+// Pipelining: several requests in flight at once, answered by id rather than
+// by arrival order. The server no longer serializes handling, so this is the
+// property that replaces the old ordering guarantee — and the reason a slow
+// judge call can no longer stall ingestion behind it.
+const pipelined = await Promise.all([
+  request("stats/get", {}),
+  request("health/get", {}),
+  request("queue/status", {}),
+  request("lessons/query", { taskText: "fix the failing test", limit: 1 }),
+  request("stats/get", {}),
+]);
+check(
+  "concurrent in-flight requests are each answered correctly",
+  pipelined.every((r) => r !== undefined && res(r) !== undefined) &&
+    typeof (res(pipelined[1]!)?.db) === "string" &&
+    typeof (res(pipelined[2]!)?.capacity) === "number",
+);
+
 // 5. The governed judge.
 const refused = await request("judge/run", { taskId: t.task.id });
 check("judge/run refused while not idle", res(refused)?.ok === false && res(refused)?.reason === "not_idle");

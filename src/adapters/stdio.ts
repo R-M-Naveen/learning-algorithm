@@ -256,16 +256,28 @@ const UNKNOWN_METHOD = Symbol("unknown-method");
 export function startStdioServer(): void {
   const server = new LearningServer();
   const lines = createInterface({ input: process.stdin });
-  let chain: Promise<void> = Promise.resolve();
+  // Handled concurrently, NOT chained. Chaining kept responses in request
+  // order, which JSON-RPC never asked for — the client matches on id, and
+  // both clients here do. What it bought instead was head-of-line blocking:
+  // every handler is a synchronous SQLite write except judge/run, which
+  // awaits the gateway with a 620s timeout, so one background judgement
+  // could stall the app's next lessons/query — and every event/append behind
+  // it — for ten minutes. "The UI must never stall on learning" is the whole
+  // point of this process, so the ordering guarantee is the thing that goes.
+  const inFlight = new Set<Promise<void>>();
   lines.on("line", (line) => {
-    // Serialize handling so responses keep request order on one pipe.
-    chain = chain.then(async () => {
+    const p = (async () => {
       const out = await server.handleLine(line);
+      // One write per line: process.stdout.write of a single string is
+      // atomic enough here, so interleaved responses stay whole lines.
       if (out !== null) process.stdout.write(out + "\n");
-    });
+    })().finally(() => inFlight.delete(p));
+    inFlight.add(p);
   });
   const shutdown = () => {
-    void chain.finally(() => {
+    // In-flight work is allowed to finish: an aborted judge call bills
+    // anyway. The client owns the grace timer.
+    void Promise.allSettled([...inFlight]).finally(() => {
       server.close();
       process.exit(0);
     });
