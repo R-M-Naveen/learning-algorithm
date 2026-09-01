@@ -11,7 +11,15 @@ import { join } from "node:path";
 import { generateTrajectory } from "../src/synth/generator.ts";
 
 const dbPath = join(mkdtempSync(join(tmpdir(), "learning-conformance-")), "learning.db");
-const proc = spawn(process.execPath, ["--import", "tsx", "src/adapters/stdio.ts"], {
+// By default this drives the dev entry through tsx. Point
+// LEARNING_SIDECAR_ENTRY at dist/sidecar/learning-sidecar.mjs (see
+// `npm run conformance:bundle`) to run the same suite against the artifact
+// that actually ships — the bundle, not the source. A protocol suite that
+// only ever exercises the dev loader cannot tell you the shipped thing works.
+const shippedEntry = process.env.LEARNING_SIDECAR_ENTRY;
+const spawnArgs = shippedEntry ? [shippedEntry] : ["--import", "tsx", "src/adapters/stdio.ts"];
+if (shippedEntry) console.log(`  (driving the shipped bundle: ${shippedEntry})`);
+const proc = spawn(process.execPath, spawnArgs, {
   stdio: ["pipe", "pipe", "inherit"],
 });
 

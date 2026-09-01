@@ -10,6 +10,43 @@ The app is ONE client of this protocol. The conformance suite in
 `conformance/` is the executable spec; anything that drives the sidecar the
 way the suite does is a valid client.
 
+## How it ships, and how a client launches it
+
+`npm run bundle` produces `dist/sidecar/` — a self-contained directory. That
+directory is the contract with a host app, exactly as
+`unbiased-app-engine`'s `make bundle` is: the app copies it into its package
+and nothing else crosses the repo boundary.
+
+The app must not know how this repo is built. It resolves a **directory** and
+reads `sidecar.json` to learn how to run what is inside:
+
+```jsonc
+{
+  "name": "learning-algorithm",
+  "version": "0.1.0",
+  "protocolVersion": 1,          // send this in learning/initialize
+  "runtime": "node",             // spawn the host's own Node…
+  "entry": "learning-sidecar.mjs", // …with this script
+  "args": [],
+  "minNodeVersion": "22.5.0",    // refuse early with a clear message
+  "builtAt": "…"
+}
+```
+
+That manifest is the hook. Shipping a compiled binary later
+(`"runtime": "executable"`), renaming the entry, or needing an extra flag is a
+change to the manifest — not to the app. In Electron, `"runtime": "node"`
+means `process.execPath` with `ELECTRON_RUN_AS_NODE=1`.
+
+Where the app looks for the directory is its own hook, and should mirror
+`resolveEngineDir`: an env override first (for development and tests), then
+the packaged resources path, then a sibling checkout.
+
+`npm run conformance:bundle` runs this whole suite against the built bundle
+rather than the tsx dev entry, so the thing that ships is the thing that is
+tested. `tsx` is a dev-only loader and must never be what launches the
+sidecar in a packaged app.
+
 ## Lifecycle
 
 - The client spawns the sidecar and MUST send `learning/initialize` first.
