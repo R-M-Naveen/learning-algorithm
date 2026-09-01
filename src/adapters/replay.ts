@@ -69,6 +69,36 @@ function exitCodeFrom(output: string): number | undefined {
   return m ? Number(m[1]) : undefined;
 }
 
+/** The authoritative record of what a patch actually did, keyed by call_id.
+ *  Collected in a pre-pass because it arrives AFTER the function_call whose
+ *  inference it supersedes, and a single forward pass cannot know whether one
+ *  is coming. */
+function patchResults(lines: string[]): Map<string, { files: string[]; deleted: string[]; success: boolean }> {
+  const out = new Map<string, { files: string[]; deleted: string[]; success: boolean }>();
+  for (const line of lines) {
+    let rec: { payload?: Record<string, unknown> };
+    try {
+      rec = JSON.parse(line) as { payload?: Record<string, unknown> };
+    } catch {
+      continue;
+    }
+    const p = rec.payload;
+    if (!p || p.type !== "patch_apply_end") continue;
+    const callId = typeof p.call_id === "string" ? p.call_id : null;
+    if (!callId) continue;
+    const changes = (p.changes ?? {}) as Record<string, { type?: string }>;
+    const files: string[] = [];
+    const deleted: string[] = [];
+    for (const [path, change] of Object.entries(changes)) {
+      if (files.length >= MAX_PATCH_FILES) break;
+      files.push(path);
+      if (change?.type === "delete") deleted.push(path);
+    }
+    out.set(callId, { files, deleted, success: p.success === true });
+  }
+  return out;
+}
+
 export function parseRollout(text: string): ReplayResult {
   let taskId = "unknown-session";
   let createdAt = new Date(0).toISOString();
@@ -98,7 +128,9 @@ export function parseRollout(text: string): ReplayResult {
     });
   };
 
-  for (const line of text.split("\n")) {
+  const lines = text.split("\n");
+  const patches = patchResults(lines);
+  for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     let rec: RolloutRecord;
@@ -173,6 +205,42 @@ export function parseRollout(text: string): ReplayResult {
               typeof p.turn_id === "string" ? p.turn_id : currentTurn,
             );
             break;
+          // The only interrupt signal a rollout carries. Dropping it made
+          // turn_interrupted (-0.6) unreachable on replayed data, so the
+          // corpus had no strong negatives — and an interrupt is now what
+          // vetoes a success in outcome classification.
+          case "turn_aborted":
+            push(
+              rec.timestamp,
+              "turn_completed",
+              `turn interrupted${typeof p.reason === "string" ? `: ${p.reason}` : ""}`,
+              {
+                status: "interrupted",
+                ...(typeof p.reason === "string" ? { reason: p.reason } : {}),
+                ...(typeof p.duration_ms === "number" ? { durationMs: p.duration_ms } : {}),
+              },
+              typeof p.turn_id === "string" ? p.turn_id : currentTurn,
+            );
+            break;
+          // The authoritative record of an edit: what actually changed, and
+          // whether it worked. Supersedes the inference made from the patch
+          // text before the patch ran.
+          case "patch_apply_end": {
+            const callId = typeof p.call_id === "string" ? p.call_id : null;
+            const result = callId ? patches.get(callId) : undefined;
+            if (!result || !result.success || !result.files.length) break;
+            const desc = result.deleted.length
+              ? `patched ${result.files.length} file(s), deleted: ${result.deleted.join(", ")}`
+              : `patched ${result.files.length} file(s): ${result.files.join(", ")}`;
+            push(
+              rec.timestamp,
+              "file_change",
+              desc,
+              { files: result.files, deletedFiles: result.deleted, applied: true },
+              typeof p.turn_id === "string" ? p.turn_id : currentTurn,
+            );
+            break;
+          }
           default:
             break; // thread_settings_applied etc.: deliberately dropped
         }
@@ -189,7 +257,12 @@ export function parseRollout(text: string): ReplayResult {
               { tool: String(p.name ?? "?"), argsSummary: clip(rawArgs) },
               turnFromMeta ?? currentTurn,
             );
-            const patch = patchedFiles(rawArgs);
+            // Only when nothing authoritative is coming for this call: a
+            // patch_apply_end record supersedes this guess, and emitting both
+            // would double-count the edit (two focused_edit signals, or a
+            // test_deletion counted twice).
+            const callId = typeof p.call_id === "string" ? p.call_id : null;
+            const patch = callId && patches.has(callId) ? null : patchedFiles(rawArgs);
             if (patch) {
               const desc = patch.deleted.length
                 ? `patched ${patch.files.length} file(s), deleted: ${patch.deleted.join(", ")}`

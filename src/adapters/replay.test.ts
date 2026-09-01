@@ -78,3 +78,99 @@ test("a patch that deletes a test file says so in the summary — the safety sig
   assert.match(del.summary, /delet/i);
   assert.deepEqual((del.data as { files: string[] }).files, ["tests/auth.test.ts"]);
 });
+
+test("turn_aborted becomes an interrupted turn — the only interrupt signal rollouts carry", () => {
+  // 15 real interruptions were being dropped, which made SIGNAL_WEIGHTS
+  // .turn_interrupted structurally unreachable on replayed data and left the
+  // corpus with no strong negatives at all. It also matters more now that an
+  // interrupt vetoes a success in outcome classification.
+  const jsonl = [
+    JSON.stringify({ type: "session_meta", timestamp: "2026-08-01T00:00:00.000Z", payload: { id: "s1", cwd: "/w" } }),
+    JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-01T00:00:05.000Z",
+      payload: { type: "turn_aborted", turn_id: "t-1", reason: "user_interrupt", duration_ms: 4200 },
+    }),
+  ].join("\n");
+  const { events } = parseRollout(jsonl);
+  const done = events.filter((e) => e.kind === "turn_completed");
+  assert.equal(done.length, 1);
+  assert.equal(done[0]!.data.status, "interrupted");
+  assert.equal(done[0]!.data.reason, "user_interrupt");
+  assert.equal(done[0]!.turnId, "t-1");
+});
+
+test("patch_apply_end is authoritative: its files win, and it does not double-count", () => {
+  // file_change was inferred from the apply_patch argument text BEFORE the
+  // patch ran, so a failed patch still minted focused_edit — or a
+  // test_deletion — for an edit that never landed.
+  const patchArgs = JSON.stringify({
+    command: "apply_patch <<'EOF'\n*** Update File: src/a.ts\n*** Delete File: src/a.test.ts\nEOF",
+  });
+  const jsonl = [
+    JSON.stringify({ type: "session_meta", timestamp: "2026-08-01T00:00:00.000Z", payload: { id: "s2", cwd: "/w" } }),
+    JSON.stringify({
+      type: "response_item",
+      timestamp: "2026-08-01T00:00:01.000Z",
+      payload: { type: "function_call", name: "shell", call_id: "c1", arguments: patchArgs },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-01T00:00:02.000Z",
+      payload: {
+        type: "patch_apply_end",
+        call_id: "c1",
+        turn_id: "t-1",
+        success: true,
+        status: "completed",
+        changes: { "/w/src/a.ts": { type: "update" }, "/w/src/a.test.ts": { type: "delete" } },
+      },
+    }),
+  ].join("\n");
+  const { events } = parseRollout(jsonl);
+  const changes = events.filter((e) => e.kind === "file_change");
+  assert.equal(changes.length, 1, "exactly one file_change per patch, from the authoritative record");
+  assert.deepEqual(changes[0]!.data.files, ["/w/src/a.ts", "/w/src/a.test.ts"]);
+  assert.deepEqual(changes[0]!.data.deletedFiles, ["/w/src/a.test.ts"]);
+});
+
+test("a patch that FAILED produces no file_change at all", () => {
+  const patchArgs = JSON.stringify({ command: "apply_patch <<'EOF'\n*** Delete File: src/a.test.ts\nEOF" });
+  const jsonl = [
+    JSON.stringify({ type: "session_meta", timestamp: "2026-08-01T00:00:00.000Z", payload: { id: "s3", cwd: "/w" } }),
+    JSON.stringify({
+      type: "response_item",
+      timestamp: "2026-08-01T00:00:01.000Z",
+      payload: { type: "function_call", name: "shell", call_id: "c9", arguments: patchArgs },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-01T00:00:02.000Z",
+      payload: { type: "patch_apply_end", call_id: "c9", turn_id: "t-1", success: false, status: "failed", changes: {} },
+    }),
+  ].join("\n");
+  const { events } = parseRollout(jsonl);
+  assert.equal(
+    events.filter((e) => e.kind === "file_change").length,
+    0,
+    "a test_deletion penalty for an edit that never landed is a false accusation",
+  );
+});
+
+test("without a patch_apply_end record the inferred file_change still stands", () => {
+  // Older rollouts carry no patch_apply_end; losing edits entirely there would
+  // be a worse regression than the false positives being fixed.
+  const patchArgs = JSON.stringify({ command: "apply_patch <<'EOF'\n*** Update File: src/b.ts\nEOF" });
+  const jsonl = [
+    JSON.stringify({ type: "session_meta", timestamp: "2026-08-01T00:00:00.000Z", payload: { id: "s4", cwd: "/w" } }),
+    JSON.stringify({
+      type: "response_item",
+      timestamp: "2026-08-01T00:00:01.000Z",
+      payload: { type: "function_call", name: "shell", call_id: "c2", arguments: patchArgs },
+    }),
+  ].join("\n");
+  const { events } = parseRollout(jsonl);
+  const changes = events.filter((e) => e.kind === "file_change");
+  assert.equal(changes.length, 1);
+  assert.deepEqual(changes[0]!.data.files, ["src/b.ts"]);
+});

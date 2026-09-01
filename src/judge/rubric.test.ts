@@ -61,3 +61,42 @@ test("the packet is capped: a huge trajectory keeps its head and tail, stays und
   assert.ok(packet.includes("turn completed"), "tail survives");
   assert.ok(packet.includes("elided"), "the elision is declared, not silent");
 });
+
+test("the signals line cannot crowd out the trajectory it is supposed to be checked against", () => {
+  // Measured on real packets: the unbounded signals line took up to 4220 of
+  // 6000 chars, leaving ~1.4 chars per event for a 1043-event trajectory. The
+  // judge was then grading the deterministic scorer's own summary, which
+  // mechanically manufactures agreement and destroys the point of a second
+  // opinion.
+  const events = Array.from({ length: 400 }, (_, i) => ({
+    id: `e${i}`,
+    taskId: "t",
+    turnId: "turn-1",
+    seq: i,
+    at: "2026-09-01T00:00:00.000Z",
+    kind: i === 0 ? ("user_message" as const) : ("tool_call" as const),
+    source: "rollout" as const,
+    summary: i === 0 ? "fix the failing test" : `ran some command number ${i} with a fairly long summary line`,
+    data: {},
+  }));
+  const signals = Array.from({ length: 300 }, (_, i) => ({
+    key: `signal_number_${i}`,
+    value: 0.05,
+    detail: `a detail string that is deliberately quite long for signal ${i}`,
+  }));
+  const packet = buildJudgePacket({ id: "t", cwd: "/w", taskType: null }, events, {
+    total: 1,
+    raw: 15,
+    signals,
+  });
+
+  assert.ok(packet.length <= PACKET_CHAR_CAP, `packet is ${packet.length}`);
+  const digest = packet.slice(packet.indexOf("EVENTS:"));
+  assert.ok(
+    digest.length > PACKET_CHAR_CAP * 0.4,
+    `the trajectory must keep a real share of the packet, got ${digest.length} of ${PACKET_CHAR_CAP}`,
+  );
+  // And the truncation must announce itself, in both places.
+  assert.match(packet, /signals elided/);
+  assert.ok(packet.includes("GOAL: fix the failing test"), "the goal survives truncation");
+});
