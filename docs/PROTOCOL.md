@@ -205,6 +205,24 @@ sidecar whenever an ingested event stream carries a `turn_completed` — the
 client never orchestrates them. The LLM judge additionally needs an explicit
 trigger (or the client's idle signal, once scheduled judging lands):
 
+### `judge/plan` (request)
+
+Params: `{ "limit"?: number, "budgetUsd"?: number }` (budget defaults to what
+is left of `monthlyBudgetUsd`).
+Result: `{ picks: [{ taskId, reason, priority, estimatedCostUsd }], candidates, estimatedTotalUsd, budgetRemainingUsd }`.
+
+**Spends nothing.** It answers "what would be worth judging, and why" so the
+answer can be read before any money moves — a sampler that silently decides to
+spend is the thing not to build.
+
+The policy is *spend the judge where the deterministic scorer is blind*: it
+prefers crowded score bands (28 of 35 real tasks read exactly 1.00, and inside
+that band the score discriminates nothing), then projects with no verdict yet
+(judge lessons are the only project-scoped ones), and reserves a quarter of
+every plan for a spread-out calibration sample so a disagreement outside the
+preferred band can still be discovered. Deterministic, so the same corpus
+always yields the same plan.
+
 ### `judge/run` (request)
 
 Params: `{ "taskId": string }`.

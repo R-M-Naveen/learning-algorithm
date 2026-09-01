@@ -19,6 +19,7 @@ import {
   type Outcome,
   type Trust,
 } from "../core/evaluation.ts";
+import type { JudgeCandidate } from "../judge/sampling.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -383,6 +384,31 @@ export class Store {
     const limit = opts.limit ?? 5;
     const hits = this.searchLessons(text, Math.max(limit * 4, 20), opts.projectKey);
     return rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null }).slice(0, limit);
+  }
+
+  /** Tasks that have never been judged, with what the sampler needs to
+   *  choose between them: the deterministic score, the project, and how many
+   *  of that project's tasks already carry a verdict. */
+  judgeCandidates(): JudgeCandidate[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.id AS id, t.total_reward AS score, t.project_key AS project_key,
+                (SELECT COUNT(*) FROM judge_jobs j2
+                   JOIN tasks t2 ON t2.id = j2.task_id
+                  WHERE j2.state = 'done'
+                    AND ((t2.project_key IS NULL AND t.project_key IS NULL) OR t2.project_key = t.project_key)
+                ) AS project_judged
+         FROM tasks t
+         WHERE NOT EXISTS (SELECT 1 FROM judge_jobs j WHERE j.task_id = t.id AND j.state = 'done')
+         ORDER BY t.created_at`,
+      )
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      taskId: r.id as string,
+      score: (r.score as number | null) ?? null,
+      projectKey: (r.project_key as string | null) ?? null,
+      projectJudged: (r.project_judged as number) ?? 0,
+    }));
   }
 
   /** Every lesson, for the report. */

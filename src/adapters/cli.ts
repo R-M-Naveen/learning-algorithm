@@ -12,6 +12,7 @@ import { generateTrajectory, ARCHETYPES, type Archetype } from "../synth/generat
 import { openStore } from "../store/db.ts";
 import { scoreTrajectory } from "../core/rewards.ts";
 import { distillLessons, repoKeyOf } from "../core/lessons.ts";
+import { ESTIMATED_JUDGE_COST_USD, selectForJudging } from "../judge/sampling.ts";
 import { runJudge } from "../judge/judge.ts";
 import { MockJudgeBackend, type JudgeBackend } from "../judge/backend.ts";
 import { ParetoJudgeBackend } from "../judge/pareto.ts";
@@ -123,6 +124,19 @@ async function main(): Promise<number> {
         );
       }
       if (!ranked.length) console.log("(no lessons matched — inject nothing)");
+      store.close();
+      return 0;
+    }
+    case "judge-plan": {
+      const store = openStore(dbPath);
+      const picks = selectForJudging(store.judgeCandidates(), {
+        limit: Number(flag(args, "limit") ?? 5),
+        budgetUsd: Number(flag(args, "budget") ?? 0.25),
+      });
+      const candidates = store.judgeCandidates().length;
+      console.log(`${candidates} unjudged task(s); plan spends ~$${(picks.length * ESTIMATED_JUDGE_COST_USD).toFixed(3)}:`);
+      for (const p of picks) console.log(`  ${p.priority.toFixed(2)}  ${p.taskId}  — ${p.reason}`);
+      if (!picks.length) console.log("  (nothing worth judging, or no budget)");
       store.close();
       return 0;
     }
