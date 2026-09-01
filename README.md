@@ -54,6 +54,11 @@ refuses events whose text still looks like a secret.
 5. ✅ Pareto judge behind strict budget/idle gates (live smoke passed 2026-08-30, $0.0029)
 6. ✅ Stdio server + conformance suite (npm run conformance)
 7. ✅ Full rollout replay report (`replay-all` + `report`; findings in data/replay-report.md)
+8b. Effectiveness measurement: holdout arms, Wilson-bound trust over
+   impressions, outcome classification that respects interrupts and declined
+   approvals, and decay as an explicit event. A lesson earns trust by
+   correlating with better outcomes against a withheld control — never by
+   surviving.
 8. App integration (`LearningClient` in unbiased-app) — the sidecar half is
    ready: `npm run bundle` emits `dist/sidecar/` with a `sidecar.json`
    manifest declaring how to launch it, and `npm run conformance:bundle`

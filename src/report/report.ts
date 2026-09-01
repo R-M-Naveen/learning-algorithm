@@ -113,5 +113,57 @@ export function buildReport(store: Store): string {
     "",
   );
 
+  // ── The arm comparison ──
+  // The whole point of the holdout: an effect claimed without a control is a
+  // correlation with task familiarity, because retrieval succeeds on the
+  // tasks that resemble work already seen. Silence about a lesson is NOT
+  // evidence for it, so nothing here is credited to survival.
+  const arms = store.armOutcomes();
+  const inject = arms.filter((a) => a.arm === "inject");
+  const holdout = arms.filter((a) => a.arm === "holdout");
+  lines.push("## Injection effect (arm comparison)", "");
+  if (!holdout.length) {
+    lines.push(
+      `No holdout arm in this corpus (${inject.length} injected task(s)). Any apparent effect here is`,
+      "uncontrolled: set `evaluation.holdoutFraction` at initialize to withhold a fraction of tasks,",
+      "or this section can only report activity, not effect.",
+      "",
+    );
+  } else {
+    const rate = (rows: typeof arms, want: string) =>
+      rows.length ? pct(rows.filter((r) => r.outcome === want).length, rows.length) : "n/a";
+    const avg = (rows: typeof arms) => mean(rows.filter((r) => r.score !== null).map((r) => r.score as number));
+    lines.push(
+      `| arm | tasks | positive | negative | mean score |`,
+      `|---|---|---|---|---|`,
+      `| inject | ${inject.length} | ${rate(inject, "positive")} | ${rate(inject, "negative")} | ${avg(inject).toFixed(2)} |`,
+      `| holdout | ${holdout.length} | ${rate(holdout, "positive")} | ${rate(holdout, "negative")} | ${avg(holdout).toFixed(2)} |`,
+      "",
+      "A difference is only worth reading once both arms hold enough tasks; with a handful either way",
+      "this table is noise, and reporting it as a win would be the same error as counting silence as",
+      "approval.",
+      "",
+    );
+  }
+
+  // ── Trust: what has been shown, and what it earned ──
+  const lessonRows = store.allLessons();
+  const judged = lessonRows
+    .map((l) => ({ l, t: store.trustFor(l.id), imp: store.impressionsFor(l.id) }))
+    .filter((x) => x.imp.inject + x.imp.holdout > 0);
+  lines.push("## Lesson trust", "");
+  if (!judged.length) {
+    lines.push("No lesson has been retrieved yet, so none has earned or lost trust.", "");
+  } else {
+    lines.push("| lesson | injected | withheld | trust | verdict |", "|---|---|---|---|---|");
+    for (const { l, t, imp } of judged.slice(0, 20)) {
+      const verdict = !t.judged ? "unproven" : (t.trust ?? 0) >= 0.2 ? "keeping" : "failing";
+      lines.push(
+        `| ${l.lesson.slice(0, 60)} | ${imp.inject} | ${imp.holdout} | ${t.trust === null ? "—" : t.trust.toFixed(2)} | ${verdict} |`,
+      );
+    }
+    lines.push("", "`unproven` means too few impressions to judge — not distrusted, just untested.", "");
+  }
+
   return lines.join("\n");
 }

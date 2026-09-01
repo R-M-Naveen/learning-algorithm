@@ -5,6 +5,14 @@ import { DatabaseSync } from "node:sqlite";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { reinforce, rankLessons, type CandidateLesson, type RankedLesson } from "../core/lessons.ts";
 import { MIN_RETRIEVAL_CONFIDENCE, lessonIsUnsafe, refute } from "../core/lessons.ts";
+import {
+  HOLDOUT_TRUST_FLOOR,
+  armFor,
+  trustScore,
+  type Arm,
+  type Outcome,
+  type Trust,
+} from "../core/evaluation.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -72,8 +80,11 @@ CREATE TABLE IF NOT EXISTS lesson_usage (
   task_id    TEXT NOT NULL,
   turn_id    TEXT,
   at         TEXT NOT NULL,
-  outcome    TEXT                   -- filled in when the turn/task resolves
+  arm        TEXT,                  -- inject | holdout (the control)
+  outcome    TEXT                   -- positive | negative | neutral, on resolve
 );
+CREATE INDEX IF NOT EXISTS lesson_usage_lesson ON lesson_usage (lesson_id);
+CREATE INDEX IF NOT EXISTS lesson_usage_task ON lesson_usage (task_id);
 CREATE TABLE IF NOT EXISTS lesson_refutations (
   id         TEXT PRIMARY KEY,
   lesson_id  TEXT NOT NULL,
@@ -130,6 +141,7 @@ export class Store {
     this.ensureColumn("lessons", "project_key", "TEXT");
     this.ensureColumn("tasks", "project_key", "TEXT");
     this.ensureColumn("tasks", "raw_reward", "REAL");
+    this.ensureColumn("lesson_usage", "arm", "TEXT");
     // A second writer (the CLI against the app's db) should wait, not throw.
     this.db.exec("PRAGMA busy_timeout = 5000;");
   }
@@ -367,6 +379,109 @@ export class Store {
     return rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null }).slice(0, limit);
   }
 
+  /** Every lesson, for the report. */
+  allLessons(): LessonRow[] {
+    const rows = this.db
+      .prepare("SELECT id, context_key, repo_key, project_key, lesson, confidence, support_count, avg_reward FROM lessons ORDER BY id")
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: r.id as string,
+      contextKey: r.context_key as string,
+      repoKey: r.repo_key as string | null,
+      projectKey: r.project_key as string | null,
+      lesson: r.lesson as string,
+      confidence: r.confidence as number,
+      supportCount: r.support_count as number,
+      avgReward: r.avg_reward as number | null,
+    }));
+  }
+
+  /** The arm comparison: for every task that had lessons retrieved, which arm
+   *  it was in and how it went. This is the primary Phase 2 metric — the
+   *  effect of injecting, measured against tasks deliberately withheld,
+   *  rather than inferred from lessons nobody deleted. */
+  armOutcomes(): { arm: string; taskId: string; outcome: string | null; score: number | null }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT u.arm AS arm, u.task_id AS task_id, u.outcome AS outcome, t.total_reward AS score
+         FROM lesson_usage u LEFT JOIN tasks t ON t.id = u.task_id`,
+      )
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      arm: (r.arm as string | null) ?? "inject",
+      taskId: r.task_id as string,
+      outcome: (r.outcome as string | null) ?? null,
+      score: (r.score as number | null) ?? null,
+    }));
+  }
+
+  /** How many times a lesson actually rode a prompt (inject), and how many
+   *  times it would have but was deliberately withheld (holdout). */
+  impressionsFor(lessonId: string): { inject: number; holdout: number } {
+    const rows = this.db
+      .prepare("SELECT arm, COUNT(*) AS n FROM lesson_usage WHERE lesson_id = ? GROUP BY arm")
+      .all(lessonId) as { arm: string | null; n: number }[];
+    let inject = 0;
+    let holdout = 0;
+    for (const r of rows) {
+      if (r.arm === "holdout") holdout += r.n;
+      else inject += r.n; // NULL arm = pre-arm rows, which were all injections
+    }
+    return { inject, holdout };
+  }
+
+  /** Trust over the INJECT arm only: a withheld lesson cannot have helped or
+   *  harmed, so counting shadow impressions against it would punish a lesson
+   *  for the control group's existence. */
+  trustFor(lessonId: string): Trust {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                SUM(CASE WHEN outcome = 'positive' THEN 1 ELSE 0 END) AS good
+         FROM lesson_usage
+         WHERE lesson_id = ? AND (arm IS NULL OR arm = 'inject') AND outcome IS NOT NULL`,
+      )
+      .get(lessonId) as { n: number; good: number | null };
+    return trustScore({ successes: row.good ?? 0, impressions: row.n });
+  }
+
+  lessonById(lessonId: string): LessonRow | null {
+    const r = this.db
+      .prepare("SELECT id, context_key, repo_key, project_key, lesson, confidence, support_count, avg_reward FROM lessons WHERE id = ?")
+      .get(lessonId) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      id: r.id as string,
+      contextKey: r.context_key as string,
+      repoKey: r.repo_key as string | null,
+      projectKey: r.project_key as string | null,
+      lesson: r.lesson as string,
+      confidence: r.confidence as number,
+      supportCount: r.support_count as number,
+      avgReward: r.avg_reward as number | null,
+    };
+  }
+
+  /** Staleness, applied as an EVENT rather than as a term in ranking: the
+   *  caller supplies the cutoff, so ranking stays time-independent and every
+   *  test stays deterministic. A lesson not used since `unusedSince` loses a
+   *  fraction of its confidence. */
+  decayUnusedLessons(unusedSince: string, factor: number): number {
+    const f = Math.max(0, Math.min(1, factor));
+    const stale = this.db
+      .prepare(
+        `SELECT l.id FROM lessons l
+         WHERE COALESCE(
+           (SELECT MAX(u.at) FROM lesson_usage u WHERE u.lesson_id = l.id),
+           l.created_at
+         ) < ?`,
+      )
+      .all(unusedSince) as { id: string }[];
+    const update = this.db.prepare("UPDATE lessons SET confidence = confidence * ? WHERE id = ?");
+    for (const row of stale) update.run(f, row.id);
+    return stale.length;
+  }
+
   /** A lesson was wrong. Lowers confidence hard and records the refutation,
    *  so a lesson the user rejected stops riding prompts without vanishing
    *  from the audit trail. The coupling seam for the app's memory_forget. */
@@ -397,20 +512,54 @@ export class Store {
     return row.n;
   }
 
+  /** Retrieval WITH an arm. The holdout arm returns nothing — structurally,
+   *  so a buggy client cannot leak the control — but records what it would
+   *  have injected, which is the row that makes the comparison possible.
+   *
+   *  Lessons that have been judged and failed are filtered out here rather
+   *  than merely ranked down: past a point, continuing to spend prompt on
+   *  something measured not to help is just cost. */
+  queryLessonsForTask(
+    text: string,
+    opts: { taskId: string; projectKey?: string | null; holdoutFraction?: number; limit?: number },
+  ): { arm: Arm; lessons: RankedLesson[] } {
+    const arm = armFor(opts.taskId, opts.holdoutFraction ?? 0);
+    const candidates = this.queryLessons(text, {
+      projectKey: opts.projectKey ?? null,
+      limit: opts.limit ?? 5,
+    }).filter((l) => {
+      const t = this.trustFor(l.id);
+      return !t.judged || (t.trust ?? 0) >= HOLDOUT_TRUST_FLOOR;
+    });
+    if (arm === "holdout") {
+      // The shadow impression: this is what the user would have been given.
+      this.recordLessonUse(candidates.map((l) => l.id), opts.taskId, null, "holdout");
+      return { arm, lessons: [] };
+    }
+    return { arm, lessons: candidates };
+  }
+
   /** The audit half of injection: which lessons rode which task. */
-  recordLessonUse(lessonIds: string[], taskId: string, turnId?: string | null): void {
+  recordLessonUse(lessonIds: string[], taskId: string, turnId?: string | null, arm: Arm = "inject"): void {
     const insert = this.db.prepare(
-      `INSERT OR IGNORE INTO lesson_usage (id, lesson_id, task_id, turn_id, at, outcome)
-       VALUES (?, ?, ?, ?, datetime('now'), NULL)`,
+      `INSERT OR IGNORE INTO lesson_usage (id, lesson_id, task_id, turn_id, at, arm, outcome)
+       VALUES (?, ?, ?, ?, datetime('now'), ?, NULL)`,
     );
     for (const lessonId of lessonIds) {
-      insert.run(`${taskId}:${lessonId}`, lessonId, taskId, turnId ?? null);
+      insert.run(`${taskId}:${lessonId}`, lessonId, taskId, turnId ?? null, arm);
       this.db.prepare("UPDATE lessons SET last_used_at = datetime('now') WHERE id = ?").run(lessonId);
     }
   }
 
   resolveLessonUse(taskId: string, outcome: string): void {
     this.db.prepare("UPDATE lesson_usage SET outcome = ? WHERE task_id = ? AND outcome IS NULL").run(outcome, taskId);
+  }
+
+  /** The classified form. `outcome` here comes from classifyOutcome, which
+   *  vetoes a success on an interrupt or a declined approval — the two ways
+   *  the user corrects the agent that a score cannot see. */
+  resolveLessonUseWithOutcome(taskId: string, outcome: Outcome): void {
+    this.resolveLessonUse(taskId, outcome);
   }
 
   usageForTask(taskId: string): { lessonId: string; turnId: string | null; outcome: string | null }[] {

@@ -68,6 +68,9 @@ sidecar in a packaged app.
   "protocolVersion": 1,
   "clientInfo": { "name": "unbiased_app", "version": "1.7.0" },
   "dbPath": "/path/to/learning.db",       // client-owned location (app: userData)
+  "evaluation": {
+    "holdoutFraction": 0                   // fraction of tasks WITHHELD from injection
+  },
   "judge": {
     "mode": "mock",                        // "mock" | "local" | "pareto"
     "enabled": false,                      // pareto mode is opt-in, default OFF
@@ -111,7 +114,9 @@ Result: `{ "depth": n, "capacity": n, "dropping": bool }`.
 ### `health/get` (request)
 
 Result: `{ "ok": true, "db": "open", "judge": { "mode", "enabled", "inFlight", "spentUsd" }, "store": {…} }`
-where `store` is the same rollup `stats/get` returns. `judge.inFlight` is
+plus `evaluation: { holdoutFraction }` — an evaluation running invisibly is a
+trap, so the posture is always readable. `store` is the same rollup
+`stats/get` returns. `judge.inFlight` is
 currently always 0 — the governor's counter is not exposed.
 
 ### `health/idle` (notification, client → sidecar)
@@ -125,6 +130,21 @@ running. With `judge.onlyWhenIdle`, no judge call starts while not idle.
 
 Params: `{ "taskText": string, "projectKey"?: string, "cwd"?: string, "repoKey"?: string, "limit"?: number }`.
 Result: `{ "lessons": [{ "id", "text", "contextKey", "projectKey", "confidence", "supportCount", "score" }] }`.
+
+**Pass `taskId` too.** With one, retrieval runs an *arm*: a deterministic
+fraction of tasks (`evaluation.holdoutFraction`) is **withheld**, and the
+response carries `arm: "inject" | "holdout"`. In the holdout arm `lessons` is
+always `[]` — structurally, so a client cannot leak the control — and the
+sidecar records a shadow impression of what it *would* have returned.
+
+This is not optional rigour. Retrieval succeeds when a task's text resembles
+work already seen, which correlates with the task being easier, so "tasks
+that got lessons went better" measures familiarity unless something is
+withheld to compare against. Silence — a lesson nobody deleted — is not
+evidence for it either.
+
+Lessons that have been shown enough times to judge and did not help are
+filtered out here rather than merely ranked down.
 
 **Pass `projectKey`.** It is the scope, and it is a hard filter: a scoped
 query returns this project's lessons plus universal advice and nothing from
@@ -146,10 +166,24 @@ nothing computes a task type yet, so every lesson currently sits in
 ### `lessons/used` (notification, client → sidecar)
 
 Params: `{ "lessonIds": string[], "taskId": string, "turnId"?: string }`.
+Only the INJECT arm sends this, and only after the lessons really rode a
+prompt: a query is not evidence of injection, so an impression is counted
+here, not at query time.
 The audit half: which lessons were actually injected, so later outcomes on
 that task attribute back to them (`lesson_usage` table). Without this,
 "did learning help?" is unanswerable. The sidecar resolves open usage rows
 automatically when the task's `turn_completed` arrives.
+
+### `lessons/decay` (request)
+
+Params: `{ "unusedSince": ISO8601, "factor"?: number }` (default `0.9`).
+Result: `{ "ok": true, "decayed": n }`.
+
+Staleness, applied as an event with the CALLER's clock rather than as a term
+in ranking — ranking stays time-independent so it stays testable. A lesson not
+retrieved since `unusedSince` keeps `factor` of its confidence. Good advice
+that has gone quiet should get quieter; a lesson that only ever rises is the
+same bug as counting silence as approval.
 
 ### `lessons/refute` (request)
 

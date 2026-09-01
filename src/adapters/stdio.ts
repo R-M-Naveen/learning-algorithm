@@ -9,6 +9,7 @@ import { openStore, type Store } from "../store/db.ts";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { scoreTrajectory } from "../core/rewards.ts";
 import { distillLessons, repoKeyOf } from "../core/lessons.ts";
+import { classifyOutcome } from "../core/evaluation.ts";
 import { MockJudgeBackend, type JudgeBackend, type JudgeMode } from "../judge/backend.ts";
 import { paretoBackendFromEnv } from "../judge/key.ts";
 import { JudgeGovernor, runJudgeGated } from "../judge/governor.ts";
@@ -36,6 +37,11 @@ export class LearningServer {
   store: Store | null = null;
   private governor: JudgeGovernor | null = null;
   private judgeCfg: JudgeConfig | null = null;
+  /** What fraction of tasks are WITHHELD so the effect of injecting can be
+   *  measured against a control. 0 (all tasks get lessons) unless the client
+   *  asks for an evaluation, because withholding costs the user something and
+   *  should be a deliberate choice. */
+  private holdoutFraction = 0;
 
   /** One line in, one line out (or null for notifications). */
   async handleLine(line: string): Promise<string | null> {
@@ -85,6 +91,11 @@ export class LearningServer {
         onlyWhenIdle: j.onlyWhenIdle !== false,
         monthlyBudgetUsd: typeof j.monthlyBudgetUsd === "number" ? j.monthlyBudgetUsd : 0,
       };
+      const evaluation = (p.evaluation ?? {}) as { holdoutFraction?: unknown };
+      this.holdoutFraction =
+        typeof evaluation.holdoutFraction === "number"
+          ? Math.max(0, Math.min(1, evaluation.holdoutFraction))
+          : 0;
       this.governor = new JudgeGovernor({
         enabled: this.judgeCfg.enabled,
         maxInFlight: this.judgeCfg.maxInFlight,
@@ -124,6 +135,10 @@ export class LearningServer {
         return {
           ok: true,
           db: "open",
+          // An evaluation running invisibly is a trap: a user wondering why
+          // the agent seems worse today deserves to be able to find out that
+          // a fifth of their tasks are deliberately unassisted.
+          evaluation: { holdoutFraction: this.holdoutFraction },
           judge: {
             mode: this.judgeCfg!.mode,
             inFlight: 0,
@@ -138,6 +153,30 @@ export class LearningServer {
         return null;
       case "lessons/query": {
         const store = this.need();
+        // With a taskId, retrieval runs an ARM: a deterministic fraction of
+        // tasks are withheld so the effect of injecting can be measured
+        // against a control instead of asserted. Without one (CLI, report),
+        // it is a plain query.
+        if (typeof p.taskId === "string" && p.taskId) {
+          const r = store.queryLessonsForTask(String(p.taskText ?? ""), {
+            taskId: p.taskId,
+            projectKey: typeof p.projectKey === "string" ? p.projectKey : null,
+            holdoutFraction: this.holdoutFraction,
+            limit: typeof p.limit === "number" ? p.limit : 5,
+          });
+          return {
+            arm: r.arm,
+            lessons: r.lessons.map((l) => ({
+              id: l.id,
+              text: l.lesson,
+              contextKey: l.contextKey,
+              projectKey: l.projectKey ?? null,
+              confidence: l.confidence,
+              supportCount: l.supportCount,
+              score: l.finalScore,
+            })),
+          };
+        }
         const ranked = store.queryLessons(String(p.taskText ?? ""), {
           repoKey: typeof p.cwd === "string" ? repoKeyOf(p.cwd) : ((p.repoKey as string | undefined) ?? null),
           // Scope, when the client declares one: this project's lessons plus
@@ -168,6 +207,15 @@ export class LearningServer {
         const r = store.refuteLesson(id, typeof p.reason === "string" ? p.reason : null);
         if ("error" in r) return { ok: false, reason: "unknown_lesson" };
         return { ok: true, confidence: r.confidence };
+      }
+      // Staleness on the caller's clock. Ranking stays time-independent; the
+      // app decides when a lesson has gone quiet for long enough.
+      case "lessons/decay": {
+        const store = this.need();
+        const unusedSince = typeof p.unusedSince === "string" ? p.unusedSince : null;
+        if (!unusedSince) return { ok: false, reason: "missing_unused_since" };
+        const factor = typeof p.factor === "number" ? p.factor : 0.9;
+        return { ok: true, decayed: store.decayUnusedLessons(unusedSince, factor) };
       }
       case "lessons/used": {
         const store = this.need();
@@ -236,7 +284,11 @@ export class LearningServer {
         ),
         score.total,
       );
-      store.resolveLessonUse(taskId, status);
+      // The outcome a lesson is judged by. NOT the raw turn status: an
+      // interrupt or a declined approval is the user correcting the agent,
+      // and a bare completion at a mediocre score is not evidence that
+      // anything helped.
+      store.resolveLessonUseWithOutcome(taskId, classifyOutcome(all, score.total));
     }
   }
 

@@ -242,3 +242,70 @@ test("a score is attributed, not just totalled: raw survives the clamp and signa
   for (const r of attributed) assert.ok(ids.has(r.eventId!), `${r.eventId} is not an event of this task`);
   store.close();
 });
+
+test("the holdout arm records a shadow impression and injects nothing", () => {
+  // Without a withheld arm, "tasks with lessons went better" is confounded by
+  // the tasks that retrieve lessons being the familiar ones. The shadow row is
+  // what makes the control comparable: same retrieval, no injection.
+  const store = openStore(":memory:");
+  store.absorbLessons(
+    [{ id: "l1", contextKey: "general", repoKey: null, projectKey: null,
+       lesson: "Reproduce the failing test first, then edit.", polarity: "do" as const }],
+    1.0,
+  );
+  const held = store.queryLessonsForTask("reproduce failing test", { taskId: "t-held", holdoutFraction: 1 });
+  assert.equal(held.arm, "holdout");
+  assert.deepEqual(held.lessons, [], "the holdout arm must return nothing the app could inject");
+  assert.equal(store.impressionsFor("l1").holdout, 1, "but the shadow impression is on the record");
+
+  const shown = store.queryLessonsForTask("reproduce failing test", { taskId: "t-shown", holdoutFraction: 0 });
+  assert.equal(shown.arm, "inject");
+  assert.equal(shown.lessons.length, 1);
+  // The inject arm's impression is only counted once the app CONFIRMS it rode
+  // a prompt — the query alone is not evidence of injection.
+  assert.equal(store.impressionsFor("l1").inject, 0);
+  store.recordLessonUse(["l1"], "t-shown", "turn-1");
+  assert.equal(store.impressionsFor("l1").inject, 1);
+  store.close();
+});
+
+test("being shown and not helping drives trust down and eventually out of retrieval", () => {
+  const store = openStore(":memory:");
+  store.absorbLessons(
+    [{ id: "dud", contextKey: "general", repoKey: null, projectKey: null,
+       lesson: "Always reformat the whole file before editing.", polarity: "do" as const }],
+    1.0,
+  );
+  // Six injections, every one of them followed by a turn the user interrupted.
+  for (let i = 0; i < 6; i++) {
+    store.recordLessonUse(["dud"], `t-${i}`, "turn-1");
+    store.resolveLessonUseWithOutcome(`t-${i}`, "negative");
+  }
+  const t = store.trustFor("dud");
+  assert.equal(t.judged, true);
+  assert.ok((t.trust ?? 1) < 0.2, `trust should be low, got ${t.trust}`);
+  assert.equal(
+    store.queryLessonsForTask("reformat whole file", { taskId: "t-next", holdoutFraction: 0 }).lessons.length,
+    0,
+    "a lesson that has been shown repeatedly without helping stops being retrieved",
+  );
+  store.close();
+});
+
+test("decay is an explicit event with a caller-supplied clock, not a term in ranking", () => {
+  // Ranking stays time-independent on purpose; staleness is applied by a call
+  // whose `unusedSince` the caller decides, so tests stay deterministic.
+  const store = openStore(":memory:");
+  store.absorbLessons(
+    [{ id: "stale", contextKey: "general", repoKey: null, projectKey: null,
+       lesson: "The build script lives in tools/build.sh.", polarity: "do" as const }],
+    1.0,
+  );
+  const before = store.lessonById("stale")!.confidence;
+  const n = store.decayUnusedLessons("2999-01-01T00:00:00.000Z", 0.5);
+  assert.equal(n, 1);
+  assert.ok(store.lessonById("stale")!.confidence < before);
+  // Nothing is due when the cutoff predates every lesson.
+  assert.equal(store.decayUnusedLessons("1999-01-01T00:00:00.000Z", 0.5), 0);
+  store.close();
+});

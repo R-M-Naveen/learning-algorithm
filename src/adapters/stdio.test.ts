@@ -83,7 +83,10 @@ test("lessons/used is a notification (no reply) and records + resolves through t
   assert.equal(none, null);
   assert.equal(s.store!.usageForTask(t.task.id)[0]!.outcome, null);
   await send(s, { method: "event/batchAppend", id: 9, params: { events: t.events.slice(3) } });
-  assert.equal(s.store!.usageForTask(t.task.id)[0]!.outcome, "completed");
+  // The CLASSIFIED outcome, not the raw turn status: what a lesson is judged
+  // by has to account for the user interrupting or refusing, which a status of
+  // "completed" cannot express.
+  assert.equal(s.store!.usageForTask(t.task.id)[0]!.outcome, "positive");
 });
 
 test("judge/run is governed: refused while busy, admitted after health/idle says idle", async () => {
