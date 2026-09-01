@@ -4,7 +4,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { reinforce, rankLessons, type CandidateLesson, type RankedLesson } from "../core/lessons.ts";
-import { MIN_RETRIEVAL_CONFIDENCE, refute } from "../core/lessons.ts";
+import { MIN_RETRIEVAL_CONFIDENCE, lessonIsUnsafe, refute } from "../core/lessons.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -295,6 +295,11 @@ export class Store {
   absorbLessons(candidates: CandidateLesson[], taskReward: number): void {
     const read = this.db.prepare("SELECT confidence, support_count, avg_reward FROM lessons WHERE id = ?");
     for (const c of candidates) {
+      // Refused, not sanitized-in-place: the id is a hash of the text, so
+      // rewriting the text here would divorce a row from its identity. The
+      // boundary that produced it is responsible for sanitizing (judge.ts
+      // does), and this catches the call site that forgot.
+      if (lessonIsUnsafe(c.lesson)) continue;
       const row = read.get(c.id) as
         | { confidence: number; support_count: number; avg_reward: number | null }
         | undefined;

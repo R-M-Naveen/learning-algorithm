@@ -205,3 +205,17 @@ test("a refuted lesson stops being retrieved, and the refutation is on the recor
   assert.ok("error" in store.refuteLesson("no-such-lesson"));
   store.close();
 });
+
+test("the store refuses a lesson whose text still carries a secret", () => {
+  // Belt-and-suspenders, the same shape as validateEvent refusing an event:
+  // the boundary sanitizes, the store still checks, because a lesson goes
+  // back out into a prompt.
+  const store = openStore(":memory:");
+  store.absorbLessons(
+    [{ id: "leaky", contextKey: "general", repoKey: null, projectKey: null,
+       lesson: "Authenticate with Bearer abcdefghijklmnopqrstuv when deploying.", polarity: "do" as const }],
+    1.0,
+  );
+  assert.equal(store.stats().lessons, 0, "a lesson carrying a secret must not be stored");
+  store.close();
+});

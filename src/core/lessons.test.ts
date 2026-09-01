@@ -1,6 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { distillLessons, lessonId, refute, reinforce, rankLessons, type CandidateLesson } from "./lessons.ts";
+import {
+  LESSON_MAX,
+  distillLessons,
+  lessonId,
+  refute,
+  reinforce,
+  rankLessons,
+  sanitizeLesson,
+  type CandidateLesson,
+} from "./lessons.ts";
 import { scoreTrajectory } from "./rewards.ts";
 import { generateTrajectory, type Archetype } from "../synth/generator.ts";
 
@@ -132,4 +141,13 @@ test("one human refutation outweighs several machine reinforcements", () => {
 test("reinforce can rehabilitate a refuted lesson", () => {
   const beaten = refute(refute(reinforce(null, { taskReward: 1.0 })));
   assert.ok(reinforce(beaten, { taskReward: 1.0 }).confidence > beaten.confidence);
+});
+
+test("sanitizeLesson redacts secrets and bounds length before a lesson is stored", () => {
+  const dirty = "Use the token sk-abcdefghijklmnopqrstuvwxyz012345 when calling the API.";
+  const clean = sanitizeLesson(dirty);
+  assert.ok(!/sk-abcdefghij/.test(clean), `secret survived: ${clean}`);
+  assert.ok(clean.length > 0);
+  assert.ok(sanitizeLesson("x".repeat(5000)).length <= LESSON_MAX);
+  assert.equal(sanitizeLesson("  keep   the   words  "), "keep the words");
 });

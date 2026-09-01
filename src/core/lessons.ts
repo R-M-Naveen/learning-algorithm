@@ -7,6 +7,7 @@
 // The judge (M4/M5) will add distillation with free-text lessons; those ride
 // the same reinforce/rank machinery.
 import { createHash } from "node:crypto";
+import { looksSecret, redactText } from "./redact.ts";
 import type { LearningEvent } from "./events.ts";
 import type { DeterministicScore } from "./rewards.ts";
 import type { TaskRow, LessonRow } from "../store/db.ts";
@@ -52,6 +53,24 @@ const SAFETY_TEMPLATES: Record<string, string> = {
  *  same text collide on one row and `upsertLesson`'s last writer decides
  *  which project it claims to be from — which is exactly how every lesson in
  *  the M7 corpus came to carry one arbitrary repo's key. */
+/** A lesson is one sentence of advice; anything longer is a digest that
+ *  wandered in. Bounded because lessons ride real prompts. */
+export const LESSON_MAX = 300;
+
+/** Free-text lessons (the judge writes them) get the same treatment event
+ *  summaries get, for the same reason: this text is persisted and then
+ *  injected into every future prompt that retrieves it, so a secret here
+ *  outlives the session it leaked from. Templates are static and safe; this
+ *  exists for everything that is not. */
+export function sanitizeLesson(text: string): string {
+  return redactText(text).replace(/\s+/g, " ").trim().slice(0, LESSON_MAX);
+}
+
+/** The store's refusal check — the belt to sanitizeLesson's braces. */
+export function lessonIsUnsafe(text: string): boolean {
+  return !text.trim() || looksSecret(text) || text.length > LESSON_MAX;
+}
+
 export function lessonId(contextKey: string, lesson: string, projectKey?: string | null): string {
   return createHash("sha256")
     .update(`${projectKey ?? ""}\n${contextKey}\n${lesson}`)

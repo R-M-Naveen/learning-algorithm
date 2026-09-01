@@ -3,7 +3,7 @@
 // replaces its job and reward — one judge verdict per task, like the
 // deterministic score.
 import { scoreTrajectory } from "../core/rewards.ts";
-import { repoKeyOf } from "../core/lessons.ts";
+import { repoKeyOf, sanitizeLesson } from "../core/lessons.ts";
 import type { Store } from "../store/db.ts";
 import type { JudgeBackend } from "./backend.ts";
 import { parseJudgeResponse, type CriterionVerdict } from "./parser.ts";
@@ -47,14 +47,19 @@ export async function runJudge(store: Store, taskId: string, backend: JudgeBacke
       // Judge lessons are claims about THIS project ("its CI slices on the
       // em dash"), so they carry the task's scope and never surface
       // elsewhere. Only the deterministic templates are universal.
-      parsed.lessons.map((l) => ({
-        id: `judge-${lessonKey(l.contextKey, l.lesson, projectKey)}`,
-        contextKey: l.contextKey,
-        repoKey: repoKeyOf(cwd),
-        projectKey,
-        lesson: l.lesson,
-        polarity: l.polarity,
-      })),
+      parsed.lessons.map((l) => {
+        // Model-authored text, so it is sanitized before it becomes an
+        // identity: redacted and bounded, exactly like an event summary.
+        const lesson = sanitizeLesson(l.lesson);
+        return {
+          id: `judge-${lessonKey(l.contextKey, lesson, projectKey)}`,
+          contextKey: l.contextKey,
+          repoKey: repoKeyOf(cwd),
+          projectKey,
+          lesson,
+          polarity: l.polarity,
+        };
+      }),
       normalized,
     );
   }
