@@ -32,7 +32,19 @@ const REPEAT_THRESHOLD = 3;
 const BROAD_EDIT_FILES = 10;
 const FOCUSED_EDIT_FILES = 3;
 
-export type Signal = { key: string; value: number; detail?: string };
+export type Signal = {
+  key: string;
+  value: number;
+  detail?: string;
+  /** The event this signal was drawn from, when there is one. Persisted so a
+   *  score can be attributed rather than only totalled — the groundwork for
+   *  per-turn credit assignment, which is the known fix for a scorer that
+   *  puts 21 of 25 real tasks at exactly 1.00. Absent on signals derived
+   *  from the whole trajectory (repeated_failed_command). */
+  eventId?: string;
+  /** The turn this signal belongs to, when the event named one. */
+  turnId?: string | null;
+};
 export type DeterministicScore = {
   /** Clamped to [-1, 1]; what downstream reward math consumes. */
   total: number;
@@ -73,20 +85,20 @@ export function scoreTrajectory(events: LearningEvent[]): DeterministicScore {
           if (okTotal < SIGNAL_WEIGHTS.command_ok_cap - 1e-9) {
             const v = Math.min(SIGNAL_WEIGHTS.command_ok, SIGNAL_WEIGHTS.command_ok_cap - okTotal);
             okTotal += v;
-            signals.push({ key: "command_ok", value: v });
+            signals.push({ key: "command_ok", value: v, eventId: e.id, turnId: e.turnId ?? null });
           }
           // A test command passing after a file change, having failed before
           // it, is the strongest deterministic evidence of a real fix —
           // unless the trajectory also deleted a test, which voids the claim.
           if (isTestCommand(cmd) && sawTestFailBeforeEdit && sawFileChange && !earnedTestPass && !sawTestDeletion) {
             earnedTestPass = true;
-            signals.push({ key: "test_pass_after_edit", value: SIGNAL_WEIGHTS.test_pass_after_edit, detail: cmd });
+            signals.push({ key: "test_pass_after_edit", value: SIGNAL_WEIGHTS.test_pass_after_edit, detail: cmd, eventId: e.id, turnId: e.turnId ?? null });
           }
         } else {
           if (failTotal > SIGNAL_WEIGHTS.command_fail_cap + 1e-9) {
             const v = Math.max(SIGNAL_WEIGHTS.command_fail, SIGNAL_WEIGHTS.command_fail_cap - failTotal);
             failTotal += v;
-            signals.push({ key: "command_fail", value: v });
+            signals.push({ key: "command_fail", value: v, eventId: e.id, turnId: e.turnId ?? null });
           }
           if (cmd) failCounts.set(cmd, (failCounts.get(cmd) ?? 0) + 1);
           if (isTestCommand(cmd) && !sawFileChange) sawTestFailBeforeEdit = true;
@@ -100,20 +112,20 @@ export function scoreTrajectory(events: LearningEvent[]): DeterministicScore {
           /delet/i.test(e.summary) && (files.some((f) => /test/i.test(f)) || /test/i.test(e.summary));
         if (deletesTest) {
           sawTestDeletion = true;
-          signals.push({ key: "test_deletion", value: SIGNAL_WEIGHTS.test_deletion, detail: files.join(", ") });
+          signals.push({ key: "test_deletion", value: SIGNAL_WEIGHTS.test_deletion, detail: files.join(", "), eventId: e.id, turnId: e.turnId ?? null });
         } else if (files.length > BROAD_EDIT_FILES) {
-          signals.push({ key: "broad_edit", value: SIGNAL_WEIGHTS.broad_edit, detail: `${files.length} files` });
+          signals.push({ key: "broad_edit", value: SIGNAL_WEIGHTS.broad_edit, detail: `${files.length} files`, eventId: e.id, turnId: e.turnId ?? null });
         } else if (files.length > 0 && files.length <= FOCUSED_EDIT_FILES) {
-          signals.push({ key: "focused_edit", value: SIGNAL_WEIGHTS.focused_edit, detail: `${files.length} file(s)` });
+          signals.push({ key: "focused_edit", value: SIGNAL_WEIGHTS.focused_edit, detail: `${files.length} file(s)`, eventId: e.id, turnId: e.turnId ?? null });
         }
         break;
       }
       case "approval_decision": {
         const d = e.data.decision as ApprovalDecision | undefined;
-        if (d === "accept") signals.push({ key: "approval_accept", value: SIGNAL_WEIGHTS.approval_accept });
+        if (d === "accept") signals.push({ key: "approval_accept", value: SIGNAL_WEIGHTS.approval_accept, eventId: e.id, turnId: e.turnId ?? null });
         else if (d === "acceptForSession")
-          signals.push({ key: "approval_accept_session", value: SIGNAL_WEIGHTS.approval_accept_session });
-        else if (d === "decline") signals.push({ key: "approval_decline", value: SIGNAL_WEIGHTS.approval_decline });
+          signals.push({ key: "approval_accept_session", value: SIGNAL_WEIGHTS.approval_accept_session, eventId: e.id, turnId: e.turnId ?? null });
+        else if (d === "decline") signals.push({ key: "approval_decline", value: SIGNAL_WEIGHTS.approval_decline, eventId: e.id, turnId: e.turnId ?? null });
         break;
       }
       case "turn_completed": {
@@ -121,17 +133,19 @@ export function scoreTrajectory(events: LearningEvent[]): DeterministicScore {
         if (status === "completed") {
           if (sawTestDeletion) {
             signals.push({
+              eventId: e.id,
+              turnId: e.turnId ?? null,
               key: "turn_completed_tainted",
               value: 0,
               detail: "completion after test deletion earns nothing",
             });
           } else {
-            signals.push({ key: "turn_completed", value: SIGNAL_WEIGHTS.turn_completed });
+            signals.push({ key: "turn_completed", value: SIGNAL_WEIGHTS.turn_completed, eventId: e.id, turnId: e.turnId ?? null });
           }
         }
-        else if (status === "failed") signals.push({ key: "turn_failed", value: SIGNAL_WEIGHTS.turn_failed });
+        else if (status === "failed") signals.push({ key: "turn_failed", value: SIGNAL_WEIGHTS.turn_failed, eventId: e.id, turnId: e.turnId ?? null });
         else if (status === "interrupted")
-          signals.push({ key: "turn_interrupted", value: SIGNAL_WEIGHTS.turn_interrupted });
+          signals.push({ key: "turn_interrupted", value: SIGNAL_WEIGHTS.turn_interrupted, eventId: e.id, turnId: e.turnId ?? null });
         break;
       }
       default:

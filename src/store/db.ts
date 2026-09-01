@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   source      TEXT NOT NULL,
   task_type   TEXT,
   outcome     TEXT,
-  total_reward REAL
+  total_reward REAL,
+  raw_reward  REAL                    -- unclamped; total hides the ceiling
 );
 CREATE TABLE IF NOT EXISTS events (
   id       TEXT PRIMARY KEY,
@@ -128,6 +129,7 @@ export class Store {
     this.ensureColumn("lessons", "polarity", "TEXT");
     this.ensureColumn("lessons", "project_key", "TEXT");
     this.ensureColumn("tasks", "project_key", "TEXT");
+    this.ensureColumn("tasks", "raw_reward", "REAL");
     // A second writer (the CLI against the app's db) should wait, not throw.
     this.db.exec("PRAGMA busy_timeout = 5000;");
   }
@@ -259,24 +261,58 @@ export class Store {
   /** Persist a deterministic score: one reward row per signal, the clamped
    *  total on the task. Replaces any previous deterministic score for the
    *  task — scoring is idempotent, not accumulative. */
-  recordScore(taskId: string, score: { total: number; raw: number; signals: { key: string; value: number; detail?: string }[] }): void {
+  recordScore(
+    taskId: string,
+    score: {
+      total: number;
+      raw: number;
+      signals: { key: string; value: number; detail?: string; eventId?: string }[];
+    },
+  ): void {
     this.db.prepare("DELETE FROM rewards WHERE task_id = ? AND kind = 'deterministic'").run(taskId);
     const insert = this.db.prepare(
       `INSERT INTO rewards (id, task_id, event_id, kind, value, detail, created_at)
-       VALUES (?, ?, NULL, 'deterministic', ?, ?, datetime('now'))`,
+       VALUES (?, ?, ?, 'deterministic', ?, ?, datetime('now'))`,
     );
     score.signals.forEach((s, i) => {
-      insert.run(`${taskId}-det-${i}`, taskId, s.value, s.detail ? `${s.key}: ${s.detail}` : s.key);
+      insert.run(`${taskId}-det-${i}`, taskId, s.eventId ?? null, s.value, s.detail ? `${s.key}: ${s.detail}` : s.key);
     });
-    this.db.prepare("UPDATE tasks SET total_reward = ? WHERE id = ?").run(score.total, taskId);
+    // Both numbers: `total` is what reward math consumes, `raw` is what the
+    // clamp hid. Without raw, 21 tasks reading "1.00" are indistinguishable
+    // whether their unclamped sum was 1.2 or 11.1, and the report cannot see
+    // that the ceiling is where the discrimination went.
+    this.db
+      .prepare("UPDATE tasks SET total_reward = ?, raw_reward = ? WHERE id = ?")
+      .run(score.total, score.raw, taskId);
   }
 
   /** The scope a task's lessons belong to, as the client declared it. */
+  /** The unclamped sum, for analysis the clamped total cannot support. */
+  taskRawReward(taskId: string): number | null {
+    const row = this.db.prepare("SELECT raw_reward FROM tasks WHERE id = ?").get(taskId) as
+      | { raw_reward: number | null }
+      | undefined;
+    return row?.raw_reward ?? null;
+  }
+
   taskProjectKey(taskId: string): string | null {
     const row = this.db.prepare("SELECT project_key FROM tasks WHERE id = ?").get(taskId) as
       | { project_key: string | null }
       | undefined;
     return row?.project_key ?? null;
+  }
+
+  /** Every reward row for a task, with the event each was attributed to. */
+  rewardsForTask(taskId: string): { kind: string; value: number; detail: string | null; eventId: string | null }[] {
+    const rows = this.db
+      .prepare("SELECT kind, value, detail, event_id FROM rewards WHERE task_id = ? ORDER BY id")
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      kind: r.kind as string,
+      value: r.value as number,
+      detail: (r.detail as string | null) ?? null,
+      eventId: (r.event_id as string | null) ?? null,
+    }));
   }
 
   taskReward(taskId: string): number | null {

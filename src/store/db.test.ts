@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openStore } from "./db.ts";
 import type { LearningEvent } from "../core/events.ts";
+import { generateTrajectory } from "../synth/generator.ts";
+import { scoreTrajectory } from "../core/rewards.ts";
 
 function ev(partial: Partial<LearningEvent>): LearningEvent {
   return {
@@ -217,5 +219,26 @@ test("the store refuses a lesson whose text still carries a secret", () => {
     1.0,
   );
   assert.equal(store.stats().lessons, 0, "a lesson carrying a secret must not be stored");
+  store.close();
+});
+
+test("a score is attributed, not just totalled: raw survives the clamp and signals name their event", () => {
+  // The clamp is where the scorer's discrimination went — 21 of 25 real tasks
+  // read exactly 1.00 with unclamped sums from 1.2 to 11.1. Persisting raw and
+  // the event behind each signal is what makes per-turn credit assignment
+  // possible later.
+  const store = openStore(":memory:");
+  const t = generateTrajectory("focused-fix-success", 11);
+  store.upsertTask(t.task);
+  store.appendEvents(t.events);
+  const score = scoreTrajectory(t.events);
+  store.recordScore(t.task.id, score);
+
+  assert.equal(store.taskReward(t.task.id), score.total);
+  assert.equal(store.taskRawReward(t.task.id), score.raw);
+  const attributed = store.rewardsForTask(t.task.id).filter((r) => r.eventId !== null);
+  assert.ok(attributed.length > 0, "event-derived signals must carry their event id");
+  const ids = new Set(t.events.map((e) => e.id));
+  for (const r of attributed) assert.ok(ids.has(r.eventId!), `${r.eventId} is not an event of this task`);
   store.close();
 });
