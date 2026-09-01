@@ -182,3 +182,26 @@ test("a project-scoped lesson never surfaces in another project; global advice s
   assert.ok(anywhere.includes("scoped-a") && anywhere.includes("scoped-b"), "an unscoped query still sees everything");
   store.close();
 });
+
+test("a refuted lesson stops being retrieved, and the refutation is on the record", () => {
+  const store = openStore(":memory:");
+  const l = { id: "doomed", contextKey: "general", repoKey: null, projectKey: null,
+    lesson: "Always run the whole suite before every commit.", polarity: "do" as const };
+  store.absorbLessons([l], 1.0);
+  assert.equal(store.queryLessons("suite commit", { limit: 5 }).length, 1);
+
+  // Refuted until it falls under the retrieval floor: the row survives for
+  // audit, but it stops riding prompts.
+  let last = 1;
+  for (let i = 0; i < 12 && last > 0; i++) {
+    const r = store.refuteLesson("doomed");
+    assert.ok(!("error" in r));
+    last = store.queryLessons("suite commit", { limit: 5 }).length;
+  }
+  assert.equal(last, 0, "a thoroughly refuted lesson must not be returned");
+  assert.equal(store.stats().lessons, 1, "the row is kept for audit");
+  assert.ok(store.refutationCount("doomed") > 0);
+
+  assert.ok("error" in store.refuteLesson("no-such-lesson"));
+  store.close();
+});

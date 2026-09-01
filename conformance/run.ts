@@ -86,6 +86,19 @@ const lessons = res(q)?.lessons as { id: string }[];
 check("lessons/query returns ranked lessons", Array.isArray(lessons) && lessons.length > 0);
 notify("lessons/used", { lessonIds: [lessons[0]!.id], taskId: t.task.id, turnId: "turn-x" });
 
+// The other half of the loop: the user rejected what a lesson became, so the
+// lesson loses confidence. A stale id is a result, not a protocol violation.
+const refuted = await request("lessons/refute", { lessonId: lessons[0]!.id, reason: "user deleted the memory" });
+check(
+  "lessons/refute lowers confidence",
+  res(refuted)?.ok === true && (res(refuted)?.confidence as number) > 0,
+);
+const bogus = await request("lessons/refute", { lessonId: "no-such-lesson" });
+check(
+  "refuting an unknown lesson is a result, not an error",
+  res(bogus)?.ok === false && res(bogus)?.reason === "unknown_lesson",
+);
+
 // 5. The governed judge.
 const refused = await request("judge/run", { taskId: t.task.id });
 check("judge/run refused while not idle", res(refused)?.ok === false && res(refused)?.reason === "not_idle");

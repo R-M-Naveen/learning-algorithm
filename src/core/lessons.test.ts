@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { distillLessons, lessonId, reinforce, rankLessons, type CandidateLesson } from "./lessons.ts";
+import { distillLessons, lessonId, refute, reinforce, rankLessons, type CandidateLesson } from "./lessons.ts";
 import { scoreTrajectory } from "./rewards.ts";
 import { generateTrajectory, type Archetype } from "../synth/generator.ts";
 
@@ -108,4 +108,28 @@ test("rankLessons: a lesson scoped to this project outranks universal advice", (
   });
   const ranked = rankLessons([mk("global", null), mk("scoped", "/work/api")], { projectKey: "/work/api" });
   assert.deepEqual(ranked.map((r) => r.id), ["scoped", "global"]);
+});
+
+test("refute lowers confidence toward zero, asymptotically, and never past it", () => {
+  const start = reinforce(null, { taskReward: 1.0 });
+  const once = refute(start);
+  const twice = refute(once);
+  assert.ok(once.confidence < start.confidence);
+  assert.ok(twice.confidence < once.confidence);
+  assert.ok(twice.confidence > 0);
+  // Support is evidence that the behaviour happened; a refutation disputes
+  // the ADVICE, so the count stands and only confidence moves.
+  assert.equal(once.supportCount, start.supportCount);
+});
+
+test("one human refutation outweighs several machine reinforcements", () => {
+  let row = reinforce(null, { taskReward: 1.0 });
+  for (let i = 0; i < 3; i++) row = reinforce(row, { taskReward: 1.0 });
+  const before = row.confidence;
+  assert.ok(refute(row).confidence < before / 1.5, "a rejection must cost more than a sighting earns");
+});
+
+test("reinforce can rehabilitate a refuted lesson", () => {
+  const beaten = refute(refute(reinforce(null, { taskReward: 1.0 })));
+  assert.ok(reinforce(beaten, { taskReward: 1.0 }).confidence > beaten.confidence);
 });

@@ -157,6 +157,18 @@ export class LearningServer {
           })),
         };
       }
+      // The other half of the feedback loop. The app calls this when the user
+      // rejects what a lesson became — deleting the memory it was proposed
+      // as, or declining it. Refusals are results, not errors: an unknown id
+      // is a stale client, not a protocol violation.
+      case "lessons/refute": {
+        const store = this.need();
+        const id = typeof p.lessonId === "string" ? p.lessonId : "";
+        if (!id) return { ok: false, reason: "missing_lesson_id" };
+        const r = store.refuteLesson(id, typeof p.reason === "string" ? p.reason : null);
+        if ("error" in r) return { ok: false, reason: "unknown_lesson" };
+        return { ok: true, confidence: r.confidence };
+      }
       case "lessons/used": {
         const store = this.need();
         const ids = Array.isArray(p.lessonIds) ? (p.lessonIds as string[]) : [];

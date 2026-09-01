@@ -4,6 +4,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { reinforce, rankLessons, type CandidateLesson, type RankedLesson } from "../core/lessons.ts";
+import { MIN_RETRIEVAL_CONFIDENCE, refute } from "../core/lessons.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -71,6 +72,12 @@ CREATE TABLE IF NOT EXISTS lesson_usage (
   turn_id    TEXT,
   at         TEXT NOT NULL,
   outcome    TEXT                   -- filled in when the turn/task resolves
+);
+CREATE TABLE IF NOT EXISTS lesson_refutations (
+  id         TEXT PRIMARY KEY,
+  lesson_id  TEXT NOT NULL,
+  at         TEXT NOT NULL,
+  reason     TEXT
 );
 CREATE TABLE IF NOT EXISTS approval_stats (
   context_key TEXT NOT NULL,
@@ -231,7 +238,8 @@ export class Store {
         `SELECT l.id, l.context_key, l.repo_key, l.project_key, l.lesson, l.confidence, l.support_count, l.avg_reward,
                 bm25(lessons_fts) AS rank
          FROM lessons_fts JOIN lessons l ON l.id = lessons_fts.id
-         WHERE lessons_fts MATCH ?${scoped ? " AND (l.project_key IS NULL OR l.project_key = ?)" : ""}
+         WHERE lessons_fts MATCH ?
+           AND l.confidence >= ${MIN_RETRIEVAL_CONFIDENCE}${scoped ? " AND (l.project_key IS NULL OR l.project_key = ?)" : ""}
          ORDER BY rank LIMIT ?`,
       )
       .all(...(scoped ? [terms, projectKey, limit] : [terms, limit])) as Record<string, unknown>[];
@@ -316,6 +324,36 @@ export class Store {
     const limit = opts.limit ?? 5;
     const hits = this.searchLessons(text, Math.max(limit * 4, 20), opts.projectKey);
     return rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null }).slice(0, limit);
+  }
+
+  /** A lesson was wrong. Lowers confidence hard and records the refutation,
+   *  so a lesson the user rejected stops riding prompts without vanishing
+   *  from the audit trail. The coupling seam for the app's memory_forget. */
+  refuteLesson(lessonId: string, reason?: string | null): { confidence: number } | { error: string } {
+    const row = this.db
+      .prepare("SELECT confidence, support_count, avg_reward FROM lessons WHERE id = ?")
+      .get(lessonId) as { confidence: number; support_count: number; avg_reward: number | null } | undefined;
+    if (!row) return { error: `unknown lesson ${lessonId}` };
+    const next = refute({
+      confidence: row.confidence,
+      supportCount: row.support_count,
+      avgReward: row.avg_reward,
+    });
+    this.db.prepare("UPDATE lessons SET confidence = ? WHERE id = ?").run(next.confidence, lessonId);
+    this.db
+      .prepare(
+        `INSERT INTO lesson_refutations (id, lesson_id, at, reason)
+         VALUES (?, ?, datetime('now'), ?)`,
+      )
+      .run(`${lessonId}:${Date.now()}:${Math.trunc(next.confidence * 1e6)}`, lessonId, reason ?? null);
+    return { confidence: next.confidence };
+  }
+
+  refutationCount(lessonId: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM lesson_refutations WHERE lesson_id = ?")
+      .get(lessonId) as { n: number };
+    return row.n;
   }
 
   /** The audit half of injection: which lessons rode which task. */

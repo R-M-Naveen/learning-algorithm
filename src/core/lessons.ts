@@ -102,6 +102,15 @@ export type ReinforcedValues = { confidence: number; supportCount: number; avgRe
 const FRESH_CONFIDENCE = 0.4;
 /** Each repeat closes this fraction of the gap to 1 — asymptotic, never 1. */
 const CONFIDENCE_STEP = 0.15;
+/** What a refutation keeps. Deliberately far harsher than a sighting earns:
+ *  reinforcement is machine evidence that a pattern recurred, a refutation is
+ *  a human saying the advice is wrong, and the second should win. Multiplicative
+ *  so it is asymptotic toward 0 and never negative. */
+const REFUTE_FACTOR = 0.5;
+/** Below this a lesson is dead: kept for audit, never retrieved. This is the
+ *  decay the system lacked — event-driven rather than time-based, so it stays
+ *  deterministic and every test stays time-independent. */
+export const MIN_RETRIEVAL_CONFIDENCE = 0.1;
 
 export function reinforce(existing: ReinforcedValues | null, input: ReinforceInput): ReinforcedValues {
   if (!existing) {
@@ -112,6 +121,14 @@ export function reinforce(existing: ReinforcedValues | null, input: ReinforceInp
   const prevAvg = existing.avgReward ?? 0;
   const avgReward = prevAvg + (input.taskReward - prevAvg) / supportCount;
   return { confidence, supportCount, avgReward };
+}
+
+/** The inverse of reinforce, for when the advice turns out to be wrong —
+ *  the user deleting the memory it became, a human review, an outcome that
+ *  contradicts it. Support is untouched: the behaviour really did recur, it
+ *  is the LESSON drawn from it that is being disputed. */
+export function refute(existing: ReinforcedValues): ReinforcedValues {
+  return { ...existing, confidence: existing.confidence * REFUTE_FACTOR };
 }
 
 // ── Retrieval ranking ────────────────────────────────────────────────────
