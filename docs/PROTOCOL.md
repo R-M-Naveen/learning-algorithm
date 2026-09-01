@@ -14,9 +14,15 @@ way the suite does is a valid client.
 
 - The client spawns the sidecar and MUST send `learning/initialize` first.
   Any other method before the handshake returns error `-32002 not initialized`.
-- Shutdown: stdin EOF or SIGTERM. The sidecar flushes its write queue and
+- Shutdown: stdin EOF or SIGTERM. The sidecar waits for in-flight work and
   exits 0. In-flight judge calls are allowed to complete (aborted upstream
-  calls still bill — see docs/EVENT-MAPPING.md notes).
+  calls still bill), so a judge call in progress can delay exit by up to its
+  620s timeout — **the client owns the grace timer** and should SIGKILL after
+  its own deadline.
+- **Responses are NOT ordered.** Lines are handled concurrently; match on
+  `id`. Ordering was given up deliberately: handling used to be chained, and
+  one slow `judge/run` then blocked every `event/append` and `lessons/query`
+  behind it for as long as the gateway took.
 
 ### `learning/initialize` (request)
 
@@ -38,16 +44,22 @@ way the suite does is a valid client.
 Response: `{ "protocolVersion": 1, "server": { "name": "learning-algorithm", "version": "0.1.0" } }`.
 Version mismatch is an error, not a silent downgrade.
 
-## Event ingestion — ack'd, bounded, droppable
+## Event ingestion
 
-Events flow client → sidecar. The sidecar owns a bounded queue; when it is
-saturated the CLIENT gets told, and low-value events are the client's to
-drop. The UI must never stall on learning.
+Events flow client → sidecar. The UI must never stall on learning, so
+low-value events are the client's to drop.
+
+> **Honesty note.** Ingestion today is a synchronous SQLite write: the queue
+> never fills, `queue/status` always answers `{depth: 0, dropping: false}`,
+> and `reason: "queue_full"` is never produced. The bounded-queue contract
+> below is reserved, not implemented — do not write a client that waits for
+> backpressure it will never be told about.
 
 ### `event/append` (request)
 
 Params: one `LearningEvent` (see docs/EVENT-MAPPING.md).
-Result: `{ "accepted": true }` or `{ "accepted": false, "reason": "queue_full" | "invalid", "detail"?: string }`.
+Result: `{ "accepted": true }` or `{ "accepted": false, "reason": "invalid", "detail"?: string }`.
+(`"queue_full"` is reserved; see the honesty note above.)
 
 ### `event/batchAppend` (request)
 
@@ -61,7 +73,9 @@ Result: `{ "depth": n, "capacity": n, "dropping": bool }`.
 
 ### `health/get` (request)
 
-Result: `{ "ok": true, "db": "open", "judge": { "mode": "...", "inFlight": n, "spentUsd": x } }`.
+Result: `{ "ok": true, "db": "open", "judge": { "mode", "enabled", "inFlight", "spentUsd" }, "store": {…} }`
+where `store` is the same rollup `stats/get` returns. `judge.inFlight` is
+currently always 0 — the governor's counter is not exposed.
 
 ### `health/idle` (notification, client → sidecar)
 
@@ -72,10 +86,25 @@ running. With `judge.onlyWhenIdle`, no judge call starts while not idle.
 
 ### `lessons/query` (request)
 
-Params: `{ "taskText": string, "cwd"?: string, "taskType"?: string, "limit"?: number }`.
-Result: `{ "lessons": [{ "id", "text", "contextKey", "confidence", "supportCount", "score" }] }`.
-Ranking is local (SQLite FTS5/BM25 + confidence/support/recency). Empty
+Params: `{ "taskText": string, "projectKey"?: string, "cwd"?: string, "repoKey"?: string, "limit"?: number }`.
+Result: `{ "lessons": [{ "id", "text", "contextKey", "projectKey", "confidence", "supportCount", "score" }] }`.
+
+**Pass `projectKey`.** It is the scope, and it is a hard filter: a scoped
+query returns this project's lessons plus universal advice and nothing from
+any other project. It must be a stable identity the CLIENT resolves — the app
+maps a worktree to its parent project before sending — because the sidecar
+must not re-derive it from `cwd`, which cannot tell `/a/api` from `/b/api`.
+Omit it only for a deliberately global query (the CLI, the report).
+
+Ranking is local: FTS5/BM25, plus confidence, plus `log(support)`, plus an
+affinity bonus when a lesson is scoped to the queried project. There is **no
+recency term** — it would make ranking time-dependent. Lessons below a
+retrieval-confidence floor are never returned (see `lessons/refute`). Empty
 result is normal and means "inject nothing".
+
+`taskType` is not a query dimension: `contextKey` is stored and returned but
+nothing computes a task type yet, so every lesson currently sits in
+`"general"`.
 
 ### `lessons/used` (notification, client → sidecar)
 
@@ -84,6 +113,19 @@ The audit half: which lessons were actually injected, so later outcomes on
 that task attribute back to them (`lesson_usage` table). Without this,
 "did learning help?" is unanswerable. The sidecar resolves open usage rows
 automatically when the task's `turn_completed` arrives.
+
+### `lessons/refute` (request)
+
+Params: `{ "lessonId": string, "reason"?: string }`.
+Result: `{ "ok": true, "confidence": x }` or `{ "ok": false, "reason": "unknown_lesson" | "missing_lesson_id" }`.
+
+The negative half of the loop, and the seam the app's memory feature calls
+when the user deletes what a lesson became. A refutation costs far more
+confidence than a sighting earns — reinforcement is machine evidence that a
+pattern recurred, a refutation is a human saying the advice is wrong — and a
+lesson driven below the retrieval floor stops riding prompts while staying on
+the record in `lesson_refutations`. Refusals are results: an unknown id means
+a stale client, not a protocol violation.
 
 ## Judging
 
@@ -96,17 +138,25 @@ trigger (or the client's idle signal, once scheduled judging lands):
 
 Params: `{ "taskId": string }`.
 Result: the gated outcome verbatim — `{ "ok": true, "result": {…} }` or
-`{ "ok": false, "reason": "disabled" | "not_idle" | "busy" | "budget_exhausted" | "payment_required" | "backpressure" | … }`.
+`{ "ok": false, "reason": "disabled" | "not_idle" | "busy" | "budget_exhausted" | "payment_required" | "payment" | "backpressure" | "unavailable" | "error" }`.
 Refusals are results, not errors: the governor saying no is normal operation.
+(`payment` is the first refusal after a live 402; `payment_required` is every
+one after it, because a 402 suspends the judge until a human re-enables it.)
+
+**Do not await `judge/run` on a request the UI is waiting for.** It can take
+up to 620s. Responses are unordered, so other calls proceed — but the answer
+to this one may be minutes away.
 
 ## Stats / audit
 
 ### `stats/get` (request)
 
-Result: rollup counts per table + judge spend, for the app's Resources view.
+Result: `{ "tasks", "events", "lessons", "rewards", "judgeSpendUsd" }` — for
+the app's Resources view.
 
 ## Errors
 
 JSON-RPC-shaped: `{ "id", "error": { "code", "message" } }`.
 `-32700` parse, `-32600` invalid request, `-32601` unknown method,
-`-32002` not initialized.
+`-32002` not initialized, `-32000` anything else thrown (including a
+protocol-version mismatch, which is an error rather than a silent downgrade).

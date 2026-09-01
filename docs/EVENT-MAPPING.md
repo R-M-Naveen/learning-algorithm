@@ -83,3 +83,16 @@ Raw engine output never touches the database. The pipeline is
 free-text field pass through `src/core/redact.ts` in the mapper, and the
 store refuses events whose free text still matches the redactor (belt and
 suspenders).
+
+## Scope: `projectKey` on `task_meta`
+
+A `task_meta` event SHOULD carry `data.projectKey` — the stable identity of
+the project this task belongs to, resolved by the client. The app resolves a
+worktree to its parent project first (its memory feature does the same, for
+the same reason: keying by cwd gives every worktree an amnesiac private
+store). The sidecar stores it on the task and scopes judge lessons to it;
+deterministic templates stay global, because "never delete tests" is true
+everywhere.
+
+Without it, a task's lessons are global — which is safe for templates and
+wrong for anything project-specific.

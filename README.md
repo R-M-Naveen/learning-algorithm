@@ -2,7 +2,9 @@
 
 Local learning sidecar for the Unbiased desktop app: records agent
 trajectories, scores outcomes, distills compact lessons, and serves them
-back for injection into future turns. All data stays on the user's machine.
+back for injection into future turns. All data stays on the user's machine —
+with one exception, opt-in and off by default: the `pareto` judge posts a
+redacted digest (which includes the task's absolute cwd) to the gateway.
 
 **Standalone-first.** The desktop app is one client of this protocol, not
 the center of the design. Today the ways in are the CLI, synthetic
