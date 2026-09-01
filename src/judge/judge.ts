@@ -55,7 +55,7 @@ export async function runJudge(store: Store, taskId: string, backend: JudgeBacke
           id: `judge-${lessonKey(l.contextKey, lesson, projectKey)}`,
           contextKey: l.contextKey,
           repoKey: repoKeyOf(cwd),
-          projectKey,
+          projectKey, turnId: null,
           lesson,
           polarity: l.polarity,
         };

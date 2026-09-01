@@ -19,6 +19,11 @@ export type CandidateLesson = {
   contextKey: string;
   /** basename of the task cwd; null when unknown. Display/affinity only. */
   repoKey: string | null;
+  /** Which turn produced it, when a turn did. Provenance for "why does the
+   *  agent believe this" — and the reason a positive lesson can be gated on
+   *  the turn that earned it rather than on the task average. null for
+   *  trajectory-level signals like repeated_failed_command. */
+  turnId: string | null;
   /** The scope this lesson is true in. null = universal advice that applies
    *  in every project. A stable, client-supplied identity (the app resolves a
    *  worktree to its parent project), NOT a cwd basename — `/a/api` and
@@ -94,20 +99,40 @@ export function distillLessons(
   // Templates are universal advice ("never delete tests"), so they distill
   // GLOBAL: one row per lesson, support accumulating across every project.
   // Project-specific claims come from the judge, which scopes its own.
-  const present = new Set(score.signals.map((s) => s.key));
   const out: CandidateLesson[] = [];
-  const push = (lesson: string, polarity: "do" | "avoid") =>
-    out.push({ id: lessonId(contextKey, lesson, null), contextKey, repoKey, projectKey: null, lesson, polarity });
+  // One candidate per lesson per TASK, crediting the first turn that produced
+  // it. Distilling per turn without this would reinforce a lesson once per
+  // turn, so support count would measure session length rather than
+  // recurrence across sessions.
+  const seen = new Set<string>();
+  const push = (lesson: string, polarity: "do" | "avoid", turnId: string | null) => {
+    const id = lessonId(contextKey, lesson, null);
+    if (seen.has(id)) return;
+    seen.add(id);
+    out.push({ id, contextKey, repoKey, projectKey: null, turnId, lesson, polarity });
+  };
 
-  for (const [signal, text] of Object.entries(SAFETY_TEMPLATES)) {
-    if (present.has(signal)) push(text, "avoid");
-  }
-  for (const [signal, text] of Object.entries(AVOID_TEMPLATES)) {
-    if (present.has(signal)) push(text, "avoid");
-  }
-  if (score.total > 0) {
-    for (const [signal, text] of Object.entries(DO_TEMPLATES)) {
-      if (present.has(signal)) push(text, "do");
+  // Per turn, so a lesson is attributed to the work that earned it. The
+  // positive gate is the TURN's score, not the task's: a task can average
+  // well because a later turn was clean while the turn that made the edit
+  // also deleted a test, and a "do" drawn from that turn is advice learned
+  // from a turn that went badly.
+  const buckets = score.perTurn.length
+    ? score.perTurn
+    : [{ turnId: null, total: score.total, raw: score.raw, signals: score.signals }];
+
+  for (const turn of buckets) {
+    const present = new Set(turn.signals.map((s) => s.key));
+    for (const [signal, text] of Object.entries(SAFETY_TEMPLATES)) {
+      if (present.has(signal)) push(text, "avoid", turn.turnId);
+    }
+    for (const [signal, text] of Object.entries(AVOID_TEMPLATES)) {
+      if (present.has(signal)) push(text, "avoid", turn.turnId);
+    }
+    if (turn.total > 0) {
+      for (const [signal, text] of Object.entries(DO_TEMPLATES)) {
+        if (present.has(signal)) push(text, "do", turn.turnId);
+      }
     }
   }
   return out;

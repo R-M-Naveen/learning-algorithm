@@ -133,8 +133,18 @@ export function scoreTrajectory(events: LearningEvent[]): DeterministicScore {
       case "file_change": {
         sawFileChange = true;
         const files = Array.isArray(e.data.files) ? (e.data.files as string[]) : [];
+        // The STRUCTURED field first. This used to be a regex over e.summary —
+        // `/delet/i.test(summary)` — which made a safety-critical signal
+        // depend on the prose a producer happened to write: an app-sourced
+        // file_change summarising as "src/a.ts" with deletedFiles
+        // ["a.test.ts"] slipped a test deletion past the check entirely. The
+        // mapper fills deletedFiles, and patch_apply_end now fills it
+        // authoritatively, so that is what to read. The prose test stays as a
+        // fallback for producers that only send a summary.
+        const deleted = Array.isArray(e.data.deletedFiles) ? (e.data.deletedFiles as string[]) : [];
         const deletesTest =
-          /delet/i.test(e.summary) && (files.some((f) => /test/i.test(f)) || /test/i.test(e.summary));
+          deleted.some((f) => /(^|[./_-])(test|tests|spec)([./_-]|$)/i.test(f)) ||
+          (/delet/i.test(e.summary) && (files.some((f) => /test/i.test(f)) || /test/i.test(e.summary)));
         if (deletesTest) {
           sawTestDeletion = true;
           signals.push({ key: "test_deletion", value: SIGNAL_WEIGHTS.test_deletion, detail: files.join(", "), eventId: e.id, turnId: e.turnId ?? null });

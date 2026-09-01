@@ -11,6 +11,7 @@ import {
   type CandidateLesson,
 } from "./lessons.ts";
 import { scoreTrajectory } from "./rewards.ts";
+import type { LearningEvent } from "./events.ts";
 import { generateTrajectory, type Archetype } from "../synth/generator.ts";
 
 function distillFrom(archetype: Archetype, seed: number): CandidateLesson[] {
@@ -150,4 +151,82 @@ test("sanitizeLesson redacts secrets and bounds length before a lesson is stored
   assert.ok(clean.length > 0);
   assert.ok(sanitizeLesson("x".repeat(5000)).length <= LESSON_MAX);
   assert.equal(sanitizeLesson("  keep   the   words  "), "keep the words");
+});
+
+// ── Per-turn distillation: which turn produced which lesson ───────────────
+
+const turnEvents = (turnId: string, kinds: [LearningEvent["kind"], Record<string, unknown>][]): LearningEvent[] =>
+  kinds.map(([kind, data], i) => ({
+    id: `${turnId}-${i}`,
+    taskId: "t",
+    turnId,
+    seq: Number(turnId.replace(/\D/g, "")) * 100 + i,
+    at: "2026-09-01T00:00:00.000Z",
+    kind,
+    source: "app" as const,
+    summary: kind,
+    data,
+  }));
+
+test("a distilled lesson records the turn that produced it", () => {
+  const events = [
+    ...turnEvents("turn-1", [
+      ["file_change", { files: ["a.ts", "b.ts"] }],
+      ["turn_completed", { status: "completed" }],
+    ]),
+  ];
+  const score = scoreTrajectory(events);
+  const out = distillLessons({ id: "t", createdAt: "x", cwd: "/w", source: "app", taskType: null }, events, score);
+  const focused = out.find((l) => /few files/i.test(l.lesson));
+  assert.ok(focused, "the focused-edit lesson should distil");
+  assert.equal(focused.turnId, "turn-1", "and it should name the turn it came from");
+});
+
+test("a positive lesson is gated on ITS OWN turn, not on the task average", () => {
+  // The task looks fine overall because turn 2 was clean, but turn 1 deleted a
+  // test while making a focused edit. A "do" lesson drawn from turn 1 would be
+  // advice learned from a turn that went badly.
+  const events = [
+    ...turnEvents("turn-1", [
+      ["file_change", { files: ["a.ts"], deletedFiles: ["a.test.ts"] }],
+      ["turn_completed", { status: "completed" }],
+    ]),
+    ...turnEvents("turn-2", [["turn_completed", { status: "completed" }]]),
+  ];
+  const score = scoreTrajectory(events);
+  const out = distillLessons({ id: "t", createdAt: "x", cwd: "/w", source: "app", taskType: null }, events, score);
+  assert.ok(out.some((l) => /never delete|weaken/i.test(l.lesson)), "the safety lesson still distils");
+  assert.ok(
+    !out.some((l) => l.polarity === "do"),
+    `no 'do' lesson from a turn that deleted a test: ${JSON.stringify(out.map((l) => l.lesson))}`,
+  );
+});
+
+test("the same lesson from several turns is one candidate, crediting the first turn", () => {
+  // Otherwise one task would reinforce a lesson once per turn, and support
+  // count would measure session length rather than recurrence across sessions.
+  const events = [
+    ...turnEvents("turn-1", [["file_change", { files: ["a.ts"] }], ["turn_completed", { status: "completed" }]]),
+    ...turnEvents("turn-2", [["file_change", { files: ["b.ts"] }], ["turn_completed", { status: "completed" }]]),
+  ];
+  const score = scoreTrajectory(events);
+  const out = distillLessons({ id: "t", createdAt: "x", cwd: "/w", source: "app", taskType: null }, events, score);
+  const focused = out.filter((l) => /few files/i.test(l.lesson));
+  assert.equal(focused.length, 1, "one candidate per task");
+  assert.equal(focused[0]!.turnId, "turn-1");
+});
+
+test("a trajectory-level signal still distils, with no turn to credit", () => {
+  const fail = (n: number): LearningEvent[] => [
+    { id: `c${n}`, taskId: "t", turnId: null, seq: n * 2, at: "2026-09-01T00:00:00.000Z",
+      kind: "tool_call", source: "app", summary: "npm test", data: { argsSummary: "npm test" } },
+    { id: `o${n}`, taskId: "t", turnId: null, seq: n * 2 + 1, at: "2026-09-01T00:00:00.000Z",
+      kind: "tool_output", source: "app", summary: "fail", data: { exitCode: 1 } },
+  ];
+  const events = [...fail(1), ...fail(2), ...fail(3)];
+  const score = scoreTrajectory(events);
+  const out = distillLessons({ id: "t", createdAt: "x", cwd: "/w", source: "app", taskType: null }, events, score);
+  const repeat = out.find((l) => /re-run it unchanged/i.test(l.lesson));
+  assert.ok(repeat, "the repeated-command lesson still distils");
+  assert.equal(repeat.turnId, null);
 });
