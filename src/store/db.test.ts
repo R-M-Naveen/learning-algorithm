@@ -80,8 +80,8 @@ test("lessons are FTS-searchable with BM25 ranking", () => {
 
 test("upsertLesson on an existing id updates confidence/support and the FTS index follows", () => {
   const store = openStore(":memory:");
-  store.upsertLesson({ id: "l1", contextKey: "k", repoKey: "r", lesson: "narrow tests first", confidence: 0.5, supportCount: 1 });
-  store.upsertLesson({ id: "l1", contextKey: "k", repoKey: "r", lesson: "run narrow tests before the full suite", confidence: 0.7, supportCount: 2 });
+  store.upsertLesson({ id: "l1", contextKey: "k", repoKey: "r", projectKey: null, lesson: "narrow tests first", confidence: 0.5, supportCount: 1 });
+  store.upsertLesson({ id: "l1", contextKey: "k", repoKey: "r", projectKey: null, lesson: "run narrow tests before the full suite", confidence: 0.7, supportCount: 2 });
   const hits = store.searchLessons("full suite", 5);
   assert.equal(hits.length, 1);
   assert.equal(hits[0]?.confidence, 0.7);
@@ -114,6 +114,7 @@ test("absorbLessons: first sighting inserts, repeat sighting reinforces the same
   const candidate = {
     id: "abc123", contextKey: "failing_test", repoKey: "repo-a",
     lesson: "Never delete or weaken tests to make the suite pass.", polarity: "avoid" as const,
+    projectKey: null,
   };
   store.absorbLessons([candidate], 0.8);
   store.absorbLessons([candidate], 0.4);
@@ -128,7 +129,7 @@ test("absorbLessons: first sighting inserts, repeat sighting reinforces the same
 test("planted lesson: the topical, same-repo lesson wins the query", () => {
   const store = openStore(":memory:");
   const plant = (id: string, repoKey: string, lesson: string) =>
-    store.absorbLessons([{ id, contextKey: "failing_test", repoKey, lesson, polarity: "do" as const }], 0.9);
+    store.absorbLessons([{ id, contextKey: "failing_test", repoKey, projectKey: null, lesson, polarity: "do" as const }], 0.9);
   plant("l-target", "webshop", "Reproduce the failing test first, then make a focused edit.");
   plant("l-other-repo", "api-server", "Reproduce the failing test first, then make a focused edit.");
   plant("l-off-topic", "webshop", "Prefer narrow lint runs before committing.");
@@ -140,7 +141,7 @@ test("planted lesson: the topical, same-repo lesson wins the query", () => {
 test("lesson usage: record on injection, resolve when the task ends, last_used_at follows", () => {
   const store = openStore(":memory:");
   store.absorbLessons(
-    [{ id: "l1", contextKey: "k", repoKey: null, lesson: "reproduce first", polarity: "do" as const }],
+    [{ id: "l1", contextKey: "k", repoKey: null, projectKey: null, lesson: "reproduce first", polarity: "do" as const }],
     0.5,
   );
   store.recordLessonUse(["l1"], "task-9", "turn-1");
@@ -152,5 +153,32 @@ test("lesson usage: record on injection, resolve when the task ends, last_used_a
   assert.equal(usage[0]!.outcome, "completed");
   const [row] = store.searchLessons("reproduce", 1);
   assert.ok(row, "lesson still searchable after use");
+  store.close();
+});
+
+test("a project-scoped lesson never surfaces in another project; global advice surfaces in both", () => {
+  // The leakage fix. Before this, repo affinity was a +0.3 ranking bonus and
+  // nothing else, so a lesson learned in one repo could outrank the local
+  // one on text relevance alone.
+  const store = openStore(":memory:");
+  store.absorbLessons(
+    [
+      { id: "scoped-a", contextKey: "general", repoKey: null, projectKey: "/work/api",
+        lesson: "The api project pins its migrations by hand.", polarity: "avoid" },
+      { id: "scoped-b", contextKey: "general", repoKey: null, projectKey: "/work/web",
+        lesson: "The web project pins its migrations by hand.", polarity: "avoid" },
+      { id: "universal", contextKey: "general", repoKey: null, projectKey: null,
+        lesson: "Never delete tests to make the suite pass, pins or otherwise.", polarity: "avoid" },
+    ],
+    1.0,
+  );
+
+  const inApi = store.queryLessons("pins migrations tests", { projectKey: "/work/api", limit: 10 }).map((l) => l.id);
+  assert.ok(inApi.includes("scoped-a"));
+  assert.ok(inApi.includes("universal"), "universal advice applies everywhere");
+  assert.ok(!inApi.includes("scoped-b"), "another project's lesson must not leak in");
+
+  const anywhere = store.queryLessons("pins migrations tests", { limit: 10 }).map((l) => l.id);
+  assert.ok(anywhere.includes("scoped-a") && anywhere.includes("scoped-b"), "an unscoped query still sees everything");
   store.close();
 });

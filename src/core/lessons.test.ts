@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { distillLessons, reinforce, rankLessons, type CandidateLesson } from "./lessons.ts";
+import { distillLessons, lessonId, reinforce, rankLessons, type CandidateLesson } from "./lessons.ts";
 import { scoreTrajectory } from "./rewards.ts";
 import { generateTrajectory, type Archetype } from "../synth/generator.ts";
 
@@ -80,4 +80,32 @@ test("rankLessons: support counts, but logarithmically — 100 sightings can't d
   });
   const ranked = rankLessons([mk("relevant", 1, 3.0), mk("popular-but-off-topic", 100, 0.2)], {});
   assert.equal(ranked[0]!.id, "relevant");
+});
+
+test("lesson identity includes the project: the same text in two projects is two lessons", () => {
+  // Without this, a judge lesson about project A merges into project B's row
+  // and the last writer's repo wins — which is how every lesson in the M7
+  // corpus ended up carrying one arbitrary repo's key.
+  const a = lessonId("general", "Run the linter before committing.", "/work/api");
+  const b = lessonId("general", "Run the linter before committing.", "/work/web");
+  const global = lessonId("general", "Run the linter before committing.", null);
+  assert.notEqual(a, b);
+  assert.notEqual(a, global);
+  assert.notEqual(b, global);
+  assert.equal(a, lessonId("general", "Run the linter before committing.", "/work/api"));
+});
+
+test("template lessons distill as global — the advice is not project-specific", () => {
+  const hack = distillFrom("test-deletion-hack", 7);
+  assert.ok(hack.length > 0);
+  for (const l of hack) assert.equal(l.projectKey, null, `${l.lesson} should be global`);
+});
+
+test("rankLessons: a lesson scoped to this project outranks universal advice", () => {
+  const mk = (id: string, projectKey: string | null) => ({
+    id, contextKey: "general", repoKey: null, projectKey, lesson: `lesson ${id}`,
+    confidence: 0.5, supportCount: 1, avgReward: 0.5, score: 1.0,
+  });
+  const ranked = rankLessons([mk("global", null), mk("scoped", "/work/api")], { projectKey: "/work/api" });
+  assert.deepEqual(ranked.map((r) => r.id), ["scoped", "global"]);
 });

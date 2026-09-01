@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   id          TEXT PRIMARY KEY,
   created_at  TEXT NOT NULL,
   cwd         TEXT,
+  project_key TEXT,                   -- client-supplied, stable across worktrees
   source      TEXT NOT NULL,
   task_type   TEXT,
   outcome     TEXT,
@@ -53,6 +54,8 @@ CREATE TABLE IF NOT EXISTS lessons (
   id            TEXT PRIMARY KEY,
   context_key   TEXT NOT NULL,
   repo_key      TEXT,
+  project_key   TEXT,                 -- NULL = universal advice
+
   lesson        TEXT NOT NULL,
   polarity      TEXT,
   confidence    REAL NOT NULL,
@@ -86,6 +89,7 @@ export type TaskRow = {
   id: string;
   createdAt: string;
   cwd?: string | null;
+  projectKey?: string | null;
   source: string;
   taskType?: string | null;
   outcome?: string | null;
@@ -95,6 +99,7 @@ export type LessonRow = {
   id: string;
   contextKey: string;
   repoKey?: string | null;
+  projectKey?: string | null;
   lesson: string;
   confidence: number;
   supportCount: number;
@@ -114,6 +119,10 @@ export class Store {
     // columns added after a database was born must be patched in.
     this.ensureColumn("judge_jobs", "duration_ms", "INTEGER");
     this.ensureColumn("lessons", "polarity", "TEXT");
+    this.ensureColumn("lessons", "project_key", "TEXT");
+    this.ensureColumn("tasks", "project_key", "TEXT");
+    // A second writer (the CLI against the app's db) should wait, not throw.
+    this.db.exec("PRAGMA busy_timeout = 5000;");
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -133,14 +142,15 @@ export class Store {
   upsertTask(t: TaskRow): void {
     this.db
       .prepare(
-        `INSERT INTO tasks (id, created_at, cwd, source, task_type, outcome)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO tasks (id, created_at, cwd, project_key, source, task_type, outcome)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            cwd = COALESCE(excluded.cwd, cwd),
+           project_key = COALESCE(excluded.project_key, project_key),
            task_type = COALESCE(excluded.task_type, task_type),
            outcome = COALESCE(excluded.outcome, outcome)`,
       )
-      .run(t.id, t.createdAt, t.cwd ?? null, t.source, t.taskType ?? null, t.outcome ?? null);
+      .run(t.id, t.createdAt, t.cwd ?? null, t.projectKey ?? null, t.source, t.taskType ?? null, t.outcome ?? null);
   }
 
   /** Validates every event; a bad one is dropped with a reason, never fatal.
@@ -185,24 +195,25 @@ export class Store {
   upsertLesson(l: LessonRow): void {
     this.db
       .prepare(
-        `INSERT INTO lessons (id, context_key, repo_key, lesson, confidence, support_count, avg_reward, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `INSERT INTO lessons (id, context_key, repo_key, project_key, lesson, confidence, support_count, avg_reward, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(id) DO UPDATE SET
            context_key = excluded.context_key,
            repo_key = excluded.repo_key,
+           project_key = excluded.project_key,
            lesson = excluded.lesson,
            confidence = excluded.confidence,
            support_count = excluded.support_count,
            avg_reward = excluded.avg_reward`,
       )
-      .run(l.id, l.contextKey, l.repoKey ?? null, l.lesson, l.confidence, l.supportCount, l.avgReward ?? null);
+      .run(l.id, l.contextKey, l.repoKey ?? null, l.projectKey ?? null, l.lesson, l.confidence, l.supportCount, l.avgReward ?? null);
     // Regenerate the FTS row rather than mutate it — same regenerate-don't-
     // mutate rule the ecosystem applies to config.
     this.db.prepare("DELETE FROM lessons_fts WHERE id = ?").run(l.id);
     this.db.prepare("INSERT INTO lessons_fts (lesson, context_key, id) VALUES (?, ?, ?)").run(l.lesson, l.contextKey, l.id);
   }
 
-  searchLessons(query: string, limit: number): (LessonRow & { score: number })[] {
+  searchLessons(query: string, limit: number, projectKey?: string | null): (LessonRow & { score: number })[] {
     // FTS5 MATCH syntax treats punctuation as operators; quote each term.
     const terms = query
       .split(/\s+/)
@@ -211,19 +222,24 @@ export class Store {
       .map((t) => `"${t}"`)
       .join(" OR ");
     if (!terms) return [];
+    // A scoped query sees this project's lessons plus universal advice, and
+    // nothing from anyone else. An unscoped query (the CLI, the report) sees
+    // everything on purpose.
+    const scoped = projectKey !== undefined && projectKey !== null;
     const rows = this.db
       .prepare(
-        `SELECT l.id, l.context_key, l.repo_key, l.lesson, l.confidence, l.support_count, l.avg_reward,
+        `SELECT l.id, l.context_key, l.repo_key, l.project_key, l.lesson, l.confidence, l.support_count, l.avg_reward,
                 bm25(lessons_fts) AS rank
          FROM lessons_fts JOIN lessons l ON l.id = lessons_fts.id
-         WHERE lessons_fts MATCH ?
+         WHERE lessons_fts MATCH ?${scoped ? " AND (l.project_key IS NULL OR l.project_key = ?)" : ""}
          ORDER BY rank LIMIT ?`,
       )
-      .all(terms, limit) as Record<string, unknown>[];
+      .all(...(scoped ? [terms, projectKey, limit] : [terms, limit])) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: r.id as string,
       contextKey: r.context_key as string,
       repoKey: r.repo_key as string | null,
+      projectKey: r.project_key as string | null,
       lesson: r.lesson as string,
       confidence: r.confidence as number,
       supportCount: r.support_count as number,
@@ -245,6 +261,14 @@ export class Store {
       insert.run(`${taskId}-det-${i}`, taskId, s.value, s.detail ? `${s.key}: ${s.detail}` : s.key);
     });
     this.db.prepare("UPDATE tasks SET total_reward = ? WHERE id = ?").run(score.total, taskId);
+  }
+
+  /** The scope a task's lessons belong to, as the client declared it. */
+  taskProjectKey(taskId: string): string | null {
+    const row = this.db.prepare("SELECT project_key FROM tasks WHERE id = ?").get(taskId) as
+      | { project_key: string | null }
+      | undefined;
+    return row?.project_key ?? null;
   }
 
   taskReward(taskId: string): number | null {
@@ -274,6 +298,7 @@ export class Store {
         id: c.id,
         contextKey: c.contextKey,
         repoKey: c.repoKey,
+        projectKey: c.projectKey ?? null,
         lesson: c.lesson,
         confidence: next.confidence,
         supportCount: next.supportCount,
@@ -284,10 +309,13 @@ export class Store {
   }
 
   /** FTS search widened, then re-ranked by confidence/support/repo affinity. */
-  queryLessons(text: string, opts: { repoKey?: string | null; limit?: number }): RankedLesson[] {
+  queryLessons(
+    text: string,
+    opts: { repoKey?: string | null; projectKey?: string | null; limit?: number },
+  ): RankedLesson[] {
     const limit = opts.limit ?? 5;
-    const hits = this.searchLessons(text, Math.max(limit * 4, 20));
-    return rankLessons(hits, { repoKey: opts.repoKey ?? null }).slice(0, limit);
+    const hits = this.searchLessons(text, Math.max(limit * 4, 20), opts.projectKey);
+    return rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null }).slice(0, limit);
   }
 
   /** The audit half of injection: which lessons rode which task. */

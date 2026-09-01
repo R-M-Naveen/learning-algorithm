@@ -140,6 +140,9 @@ export class LearningServer {
         const store = this.need();
         const ranked = store.queryLessons(String(p.taskText ?? ""), {
           repoKey: typeof p.cwd === "string" ? repoKeyOf(p.cwd) : ((p.repoKey as string | undefined) ?? null),
+          // Scope, when the client declares one: this project's lessons plus
+          // universal advice, never another project's.
+          projectKey: typeof p.projectKey === "string" ? p.projectKey : null,
           limit: typeof p.limit === "number" ? p.limit : 5,
         });
         return {
@@ -147,6 +150,7 @@ export class LearningServer {
             id: l.id,
             text: l.lesson,
             contextKey: l.contextKey,
+            projectKey: l.projectKey ?? null,
             confidence: l.confidence,
             supportCount: l.supportCount,
             score: l.finalScore,
@@ -180,7 +184,19 @@ export class LearningServer {
   private ensureTask(e: LearningEvent): void {
     if (typeof e.taskId !== "string" || !e.taskId) return;
     const cwd = e.kind === "task_meta" && typeof e.data?.cwd === "string" ? (e.data.cwd as string) : null;
-    this.store!.upsertTask({ id: e.taskId, createdAt: e.at ?? new Date(0).toISOString(), cwd, source: e.source });
+    // The scope the CLIENT declares. The app resolves a worktree to its
+    // parent project before sending; the sidecar must not re-derive it from
+    // cwd, which cannot tell `/a/api` from `/b/api` or a worktree from its
+    // project.
+    const projectKey =
+      e.kind === "task_meta" && typeof e.data?.projectKey === "string" ? (e.data.projectKey as string) : null;
+    this.store!.upsertTask({
+      id: e.taskId,
+      createdAt: e.at ?? new Date(0).toISOString(),
+      cwd,
+      projectKey,
+      source: e.source,
+    });
   }
 
   /** The sidecar's own reflexes: when a turn completes, score the task,
@@ -201,7 +217,11 @@ export class LearningServer {
       const meta = all.find((e) => e.kind === "task_meta");
       const cwd = typeof meta?.data.cwd === "string" ? (meta.data.cwd as string) : null;
       store.absorbLessons(
-        distillLessons({ id: taskId, createdAt: all[0]!.at, cwd, source: all[0]!.source, taskType: null }, all, score),
+        distillLessons(
+          { id: taskId, createdAt: all[0]!.at, cwd, projectKey: store.taskProjectKey(taskId), source: all[0]!.source, taskType: null },
+          all,
+          score,
+        ),
         score.total,
       );
       store.resolveLessonUse(taskId, status);
