@@ -20,6 +20,7 @@ import {
   type Trust,
 } from "../core/evaluation.ts";
 import type { JudgeCandidate } from "../judge/sampling.ts";
+import { dropNearDuplicates } from "../core/similarity.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -383,7 +384,18 @@ export class Store {
   ): RankedLesson[] {
     const limit = opts.limit ?? 5;
     const hits = this.searchLessons(text, Math.max(limit * 4, 20), opts.projectKey);
-    return rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null }).slice(0, limit);
+    const ranked = rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null });
+    // Suppress paraphrases AFTER ranking and BEFORE the limit: the better
+    // lesson survives, and the caller still gets `limit` distinct lessons
+    // rather than limit-minus-however-many-paraphrases. The judge writes
+    // these — two of the six lessons from its first real run were the same
+    // advice in different words — and an injection that says one thing three
+    // times spends context to annoy.
+    return dropNearDuplicates(ranked, (l) => l.lesson, {
+      // Never across scopes: the same sentence about two different projects is
+      // two facts, not one repeated.
+      groupOf: (l) => l.projectKey ?? "",
+    }).slice(0, limit);
   }
 
   /** Tasks that have never been judged, with what the sampler needs to

@@ -16,11 +16,12 @@
 // read BEFORE any money is spent. A sampler that silently decides to spend is
 // exactly the thing not to build.
 
-/** What a judgement is expected to cost. The one real Pareto call on record
- *  cost $0.0029 for a 1,783-char packet; a full 6,000-char packet extrapolates
- *  to roughly this. Deliberately an over-estimate: a plan that promises to fit
- *  a budget and then overruns it is worse than a conservative one. */
-export const ESTIMATED_JUDGE_COST_USD = 0.012;
+/** What a judgement is expected to cost, from measurement rather than
+ *  extrapolation: three real Pareto judgements on 2026-09-01 cost $0.0066,
+ *  $0.0071 and $0.0048 — mean $0.0062, over packets at the 6,000-char cap.
+ *  Rounded up, because a plan that promises to fit a budget and then overruns
+ *  it is worse than a conservative one. */
+export const ESTIMATED_JUDGE_COST_USD = 0.008;
 
 /** The share of a plan reserved for a spread-out sample rather than for the
  *  crowded band. Without it the judged set only ever covers the band the
