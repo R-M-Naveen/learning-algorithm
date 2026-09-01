@@ -108,12 +108,13 @@ async function main(): Promise<number> {
     case "query": {
       const text = args.find((a) => !a.startsWith("--"));
       if (!text) {
-        console.error("usage: query \"task text\" [--repo <key>] [--limit <n>] [--db <path>]");
+        console.error("usage: query \"task text\" [--repo <key>] [--project <key>] [--limit <n>] [--db <path>]");
         return 1;
       }
       const store = openStore(dbPath);
       const ranked = store.queryLessons(text, {
         repoKey: flag(args, "repo") ?? repoKeyOf(flag(args, "cwd")),
+        projectKey: flag(args, "project") ?? null,
         limit: Number(flag(args, "limit") ?? 5),
       });
       for (const l of ranked) {

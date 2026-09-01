@@ -9,6 +9,7 @@ import { openStore, type Store } from "../store/db.ts";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { scoreTrajectory } from "../core/rewards.ts";
 import { distillLessons, repoKeyOf } from "../core/lessons.ts";
+import { classifyOutcome } from "../core/evaluation.ts";
 import { MockJudgeBackend, type JudgeBackend, type JudgeMode } from "../judge/backend.ts";
 import { paretoBackendFromEnv } from "../judge/key.ts";
 import { JudgeGovernor, runJudgeGated } from "../judge/governor.ts";
@@ -36,6 +37,11 @@ export class LearningServer {
   store: Store | null = null;
   private governor: JudgeGovernor | null = null;
   private judgeCfg: JudgeConfig | null = null;
+  /** What fraction of tasks are WITHHELD so the effect of injecting can be
+   *  measured against a control. 0 (all tasks get lessons) unless the client
+   *  asks for an evaluation, because withholding costs the user something and
+   *  should be a deliberate choice. */
+  private holdoutFraction = 0;
 
   /** One line in, one line out (or null for notifications). */
   async handleLine(line: string): Promise<string | null> {
@@ -85,6 +91,11 @@ export class LearningServer {
         onlyWhenIdle: j.onlyWhenIdle !== false,
         monthlyBudgetUsd: typeof j.monthlyBudgetUsd === "number" ? j.monthlyBudgetUsd : 0,
       };
+      const evaluation = (p.evaluation ?? {}) as { holdoutFraction?: unknown };
+      this.holdoutFraction =
+        typeof evaluation.holdoutFraction === "number"
+          ? Math.max(0, Math.min(1, evaluation.holdoutFraction))
+          : 0;
       this.governor = new JudgeGovernor({
         enabled: this.judgeCfg.enabled,
         maxInFlight: this.judgeCfg.maxInFlight,
@@ -124,6 +135,10 @@ export class LearningServer {
         return {
           ok: true,
           db: "open",
+          // An evaluation running invisibly is a trap: a user wondering why
+          // the agent seems worse today deserves to be able to find out that
+          // a fifth of their tasks are deliberately unassisted.
+          evaluation: { holdoutFraction: this.holdoutFraction },
           judge: {
             mode: this.judgeCfg!.mode,
             inFlight: 0,
@@ -138,8 +153,35 @@ export class LearningServer {
         return null;
       case "lessons/query": {
         const store = this.need();
+        // With a taskId, retrieval runs an ARM: a deterministic fraction of
+        // tasks are withheld so the effect of injecting can be measured
+        // against a control instead of asserted. Without one (CLI, report),
+        // it is a plain query.
+        if (typeof p.taskId === "string" && p.taskId) {
+          const r = store.queryLessonsForTask(String(p.taskText ?? ""), {
+            taskId: p.taskId,
+            projectKey: typeof p.projectKey === "string" ? p.projectKey : null,
+            holdoutFraction: this.holdoutFraction,
+            limit: typeof p.limit === "number" ? p.limit : 5,
+          });
+          return {
+            arm: r.arm,
+            lessons: r.lessons.map((l) => ({
+              id: l.id,
+              text: l.lesson,
+              contextKey: l.contextKey,
+              projectKey: l.projectKey ?? null,
+              confidence: l.confidence,
+              supportCount: l.supportCount,
+              score: l.finalScore,
+            })),
+          };
+        }
         const ranked = store.queryLessons(String(p.taskText ?? ""), {
           repoKey: typeof p.cwd === "string" ? repoKeyOf(p.cwd) : ((p.repoKey as string | undefined) ?? null),
+          // Scope, when the client declares one: this project's lessons plus
+          // universal advice, never another project's.
+          projectKey: typeof p.projectKey === "string" ? p.projectKey : null,
           limit: typeof p.limit === "number" ? p.limit : 5,
         });
         return {
@@ -147,11 +189,33 @@ export class LearningServer {
             id: l.id,
             text: l.lesson,
             contextKey: l.contextKey,
+            projectKey: l.projectKey ?? null,
             confidence: l.confidence,
             supportCount: l.supportCount,
             score: l.finalScore,
           })),
         };
+      }
+      // The other half of the feedback loop. The app calls this when the user
+      // rejects what a lesson became — deleting the memory it was proposed
+      // as, or declining it. Refusals are results, not errors: an unknown id
+      // is a stale client, not a protocol violation.
+      case "lessons/refute": {
+        const store = this.need();
+        const id = typeof p.lessonId === "string" ? p.lessonId : "";
+        if (!id) return { ok: false, reason: "missing_lesson_id" };
+        const r = store.refuteLesson(id, typeof p.reason === "string" ? p.reason : null);
+        if ("error" in r) return { ok: false, reason: "unknown_lesson" };
+        return { ok: true, confidence: r.confidence };
+      }
+      // Staleness on the caller's clock. Ranking stays time-independent; the
+      // app decides when a lesson has gone quiet for long enough.
+      case "lessons/decay": {
+        const store = this.need();
+        const unusedSince = typeof p.unusedSince === "string" ? p.unusedSince : null;
+        if (!unusedSince) return { ok: false, reason: "missing_unused_since" };
+        const factor = typeof p.factor === "number" ? p.factor : 0.9;
+        return { ok: true, decayed: store.decayUnusedLessons(unusedSince, factor) };
       }
       case "lessons/used": {
         const store = this.need();
@@ -180,7 +244,19 @@ export class LearningServer {
   private ensureTask(e: LearningEvent): void {
     if (typeof e.taskId !== "string" || !e.taskId) return;
     const cwd = e.kind === "task_meta" && typeof e.data?.cwd === "string" ? (e.data.cwd as string) : null;
-    this.store!.upsertTask({ id: e.taskId, createdAt: e.at ?? new Date(0).toISOString(), cwd, source: e.source });
+    // The scope the CLIENT declares. The app resolves a worktree to its
+    // parent project before sending; the sidecar must not re-derive it from
+    // cwd, which cannot tell `/a/api` from `/b/api` or a worktree from its
+    // project.
+    const projectKey =
+      e.kind === "task_meta" && typeof e.data?.projectKey === "string" ? (e.data.projectKey as string) : null;
+    this.store!.upsertTask({
+      id: e.taskId,
+      createdAt: e.at ?? new Date(0).toISOString(),
+      cwd,
+      projectKey,
+      source: e.source,
+    });
   }
 
   /** The sidecar's own reflexes: when a turn completes, score the task,
@@ -201,10 +277,18 @@ export class LearningServer {
       const meta = all.find((e) => e.kind === "task_meta");
       const cwd = typeof meta?.data.cwd === "string" ? (meta.data.cwd as string) : null;
       store.absorbLessons(
-        distillLessons({ id: taskId, createdAt: all[0]!.at, cwd, source: all[0]!.source, taskType: null }, all, score),
+        distillLessons(
+          { id: taskId, createdAt: all[0]!.at, cwd, projectKey: store.taskProjectKey(taskId), source: all[0]!.source, taskType: null },
+          all,
+          score,
+        ),
         score.total,
       );
-      store.resolveLessonUse(taskId, status);
+      // The outcome a lesson is judged by. NOT the raw turn status: an
+      // interrupt or a declined approval is the user correcting the agent,
+      // and a bare completion at a mediocre score is not evidence that
+      // anything helped.
+      store.resolveLessonUseWithOutcome(taskId, classifyOutcome(all, score.total));
     }
   }
 
@@ -224,16 +308,28 @@ const UNKNOWN_METHOD = Symbol("unknown-method");
 export function startStdioServer(): void {
   const server = new LearningServer();
   const lines = createInterface({ input: process.stdin });
-  let chain: Promise<void> = Promise.resolve();
+  // Handled concurrently, NOT chained. Chaining kept responses in request
+  // order, which JSON-RPC never asked for — the client matches on id, and
+  // both clients here do. What it bought instead was head-of-line blocking:
+  // every handler is a synchronous SQLite write except judge/run, which
+  // awaits the gateway with a 620s timeout, so one background judgement
+  // could stall the app's next lessons/query — and every event/append behind
+  // it — for ten minutes. "The UI must never stall on learning" is the whole
+  // point of this process, so the ordering guarantee is the thing that goes.
+  const inFlight = new Set<Promise<void>>();
   lines.on("line", (line) => {
-    // Serialize handling so responses keep request order on one pipe.
-    chain = chain.then(async () => {
+    const p = (async () => {
       const out = await server.handleLine(line);
+      // One write per line: process.stdout.write of a single string is
+      // atomic enough here, so interleaved responses stay whole lines.
       if (out !== null) process.stdout.write(out + "\n");
-    });
+    })().finally(() => inFlight.delete(p));
+    inFlight.add(p);
   });
   const shutdown = () => {
-    void chain.finally(() => {
+    // In-flight work is allowed to finish: an aborted judge call bills
+    // anyway. The client owns the grace timer.
+    void Promise.allSettled([...inFlight]).finally(() => {
       server.close();
       process.exit(0);
     });

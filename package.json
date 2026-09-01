@@ -11,11 +11,14 @@
   "scripts": {
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "conformance": "node --import tsx conformance/run.ts"
+    "conformance": "node --import tsx conformance/run.ts",
+    "bundle": "node scripts/bundle.mjs",
+    "conformance:bundle": "npm run bundle && LEARNING_SIDECAR_ENTRY=dist/sidecar/learning-sidecar.mjs node --import tsx conformance/run.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "esbuild": "^0.28.2"
   }
 }

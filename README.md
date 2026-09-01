@@ -2,7 +2,9 @@
 
 Local learning sidecar for the Unbiased desktop app: records agent
 trajectories, scores outcomes, distills compact lessons, and serves them
-back for injection into future turns. All data stays on the user's machine.
+back for injection into future turns. All data stays on the user's machine —
+with one exception, opt-in and off by default: the `pareto` judge posts a
+redacted digest (which includes the task's absolute cwd) to the gateway.
 
 **Standalone-first.** The desktop app is one client of this protocol, not
 the center of the design. Today the ways in are the CLI, synthetic
@@ -52,4 +54,12 @@ refuses events whose text still looks like a secret.
 5. ✅ Pareto judge behind strict budget/idle gates (live smoke passed 2026-08-30, $0.0029)
 6. ✅ Stdio server + conformance suite (npm run conformance)
 7. ✅ Full rollout replay report (`replay-all` + `report`; findings in data/replay-report.md)
-8. App integration (`LearningClient` in unbiased-app)
+8b. Effectiveness measurement: holdout arms, Wilson-bound trust over
+   impressions, outcome classification that respects interrupts and declined
+   approvals, and decay as an explicit event. A lesson earns trust by
+   correlating with better outcomes against a withheld control — never by
+   surviving.
+8. App integration (`LearningClient` in unbiased-app) — the sidecar half is
+   ready: `npm run bundle` emits `dist/sidecar/` with a `sidecar.json`
+   manifest declaring how to launch it, and `npm run conformance:bundle`
+   drives the suite against that built artifact.

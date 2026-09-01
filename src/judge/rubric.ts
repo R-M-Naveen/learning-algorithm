@@ -42,6 +42,10 @@ Return ONLY a JSON object:
  "tags":["<short tags>"]}
 Include every criterion id exactly once. Keep rationales to 8 words or fewer.`;
 
+/** At most a quarter of the packet for the scorer's own summary. The digest is
+ *  the evidence; the signals are a hint. */
+export const SIGNALS_CHAR_BUDGET = 1500;
+
 export const PACKET_CHAR_CAP = 6000;
 
 /** Compact, already-redacted digest of a trajectory. Head and tail survive a
@@ -53,9 +57,22 @@ export function buildJudgePacket(
   score: DeterministicScore,
 ): string {
   const lines = events.map((e) => `${e.seq}. [${e.kind}] ${e.summary}`);
-  const signals = score.signals
-    .map((s) => `${s.key} ${s.value > 0 ? "+" : ""}${s.value}${s.detail ? ` (${s.detail})` : ""}`)
-    .join(", ");
+  // The signals line gets a BUDGET, not the whole packet. Unbounded, it took
+  // up to 4220 of 6000 chars on real trajectories and left ~1.4 chars per
+  // event for the digest — so the judge graded the deterministic scorer's own
+  // summary of the work instead of the work, which manufactures agreement
+  // between the two and destroys the point of asking twice.
+  const rendered = score.signals.map(
+    (s) => `${s.key} ${s.value > 0 ? "+" : ""}${s.value}${s.detail ? ` (${s.detail})` : ""}`,
+  );
+  let signals = "";
+  let shownSignals = 0;
+  for (const r of rendered) {
+    if (signals.length + r.length + 2 > SIGNALS_CHAR_BUDGET) break;
+    signals += (signals ? ", " : "") + r;
+    shownSignals++;
+  }
+  if (shownSignals < rendered.length) signals += `, … (${rendered.length - shownSignals} signals elided)`;
   const header = [
     `GOAL: ${events.find((e) => e.kind === "user_message")?.summary ?? "(not recorded — sub-agent or scheduled thread)"}`,
     `REPO: ${task.cwd ?? "unknown"}   TASK TYPE: ${task.taskType ?? "general"}`,

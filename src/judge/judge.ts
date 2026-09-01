@@ -3,7 +3,7 @@
 // replaces its job and reward — one judge verdict per task, like the
 // deterministic score.
 import { scoreTrajectory } from "../core/rewards.ts";
-import { repoKeyOf } from "../core/lessons.ts";
+import { repoKeyOf, sanitizeLesson } from "../core/lessons.ts";
 import type { Store } from "../store/db.ts";
 import type { JudgeBackend } from "./backend.ts";
 import { parseJudgeResponse, type CriterionVerdict } from "./parser.ts";
@@ -23,6 +23,7 @@ export async function runJudge(store: Store, taskId: string, backend: JudgeBacke
   const score = scoreTrajectory(events);
   const meta = events.find((e) => e.kind === "task_meta");
   const cwd = typeof meta?.data.cwd === "string" ? (meta.data.cwd as string) : null;
+  const projectKey = store.taskProjectKey(taskId);
   const packet = buildJudgePacket({ id: taskId, cwd, taskType: null }, events, score);
 
   store.beginJudgeJob(taskId, packet, backend.mode, JUDGE_PROMPT_VERSION);
@@ -43,24 +44,33 @@ export async function runJudge(store: Store, taskId: string, backend: JudgeBacke
   store.recordJudgeReward(taskId, normalized);
   if (parsed.lessons.length) {
     store.absorbLessons(
-      parsed.lessons.map((l) => ({
-        id: `judge-${lessonKey(l.contextKey, l.lesson)}`,
-        contextKey: l.contextKey,
-        repoKey: repoKeyOf(cwd),
-        lesson: l.lesson,
-        polarity: l.polarity,
-      })),
+      // Judge lessons are claims about THIS project ("its CI slices on the
+      // em dash"), so they carry the task's scope and never surface
+      // elsewhere. Only the deterministic templates are universal.
+      parsed.lessons.map((l) => {
+        // Model-authored text, so it is sanitized before it becomes an
+        // identity: redacted and bounded, exactly like an event summary.
+        const lesson = sanitizeLesson(l.lesson);
+        return {
+          id: `judge-${lessonKey(l.contextKey, lesson, projectKey)}`,
+          contextKey: l.contextKey,
+          repoKey: repoKeyOf(cwd),
+          projectKey,
+          lesson,
+          polarity: l.polarity,
+        };
+      }),
       normalized,
     );
   }
   return { taskId, normalized, verdicts, lessonsAbsorbed: parsed.lessons.length, costUsd: raw.costUsd };
 }
 
-function lessonKey(contextKey: string, lesson: string): string {
+function lessonKey(contextKey: string, lesson: string, projectKey: string | null): string {
   // Same collision-on-purpose identity rule as core/lessons.lessonId, with a
   // judge- prefix so template and judge lessons never merge silently.
   let h = 0;
-  const s = `${contextKey}\n${lesson}`;
+  const s = `${projectKey ?? ""}\n${contextKey}\n${lesson}`;
   for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
 }

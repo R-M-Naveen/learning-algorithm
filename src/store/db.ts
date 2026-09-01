@@ -1,19 +1,36 @@
-// SQLite store on node:sqlite — zero native deps, FTS5 available (verified
-// on the dev machine and required by the Electron 43 packaging spike before
-// app integration). One writer, WAL, write-then-commit discipline.
+// SQLite store on node:sqlite — zero native deps. One writer, WAL,
+// write-then-commit discipline.
+//
+// The Electron packaging spike this comment used to defer is DONE (2026-09-01):
+// the shipped bundle was driven under `ELECTRON_RUN_AS_NODE=1` against
+// Electron 43's own Node, and node:sqlite plus an FTS5 MATCH both work —
+// handshake, a 7-event ingest, the auto-distil reflex, a scoped retrieval and
+// a clean exit. That was the one unknown that could have invalidated this
+// storage choice, so it is worth stating as settled rather than assumed.
 import { DatabaseSync } from "node:sqlite";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { reinforce, rankLessons, type CandidateLesson, type RankedLesson } from "../core/lessons.ts";
+import { MIN_RETRIEVAL_CONFIDENCE, lessonIsUnsafe, refute } from "../core/lessons.ts";
+import {
+  HOLDOUT_TRUST_FLOOR,
+  armFor,
+  trustScore,
+  type Arm,
+  type Outcome,
+  type Trust,
+} from "../core/evaluation.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
   id          TEXT PRIMARY KEY,
   created_at  TEXT NOT NULL,
   cwd         TEXT,
+  project_key TEXT,                   -- client-supplied, stable across worktrees
   source      TEXT NOT NULL,
   task_type   TEXT,
   outcome     TEXT,
-  total_reward REAL
+  total_reward REAL,
+  raw_reward  REAL                    -- unclamped; total hides the ceiling
 );
 CREATE TABLE IF NOT EXISTS events (
   id       TEXT PRIMARY KEY,
@@ -53,6 +70,8 @@ CREATE TABLE IF NOT EXISTS lessons (
   id            TEXT PRIMARY KEY,
   context_key   TEXT NOT NULL,
   repo_key      TEXT,
+  project_key   TEXT,                 -- NULL = universal advice
+
   lesson        TEXT NOT NULL,
   polarity      TEXT,
   confidence    REAL NOT NULL,
@@ -67,7 +86,16 @@ CREATE TABLE IF NOT EXISTS lesson_usage (
   task_id    TEXT NOT NULL,
   turn_id    TEXT,
   at         TEXT NOT NULL,
-  outcome    TEXT                   -- filled in when the turn/task resolves
+  arm        TEXT,                  -- inject | holdout (the control)
+  outcome    TEXT                   -- positive | negative | neutral, on resolve
+);
+CREATE INDEX IF NOT EXISTS lesson_usage_lesson ON lesson_usage (lesson_id);
+CREATE INDEX IF NOT EXISTS lesson_usage_task ON lesson_usage (task_id);
+CREATE TABLE IF NOT EXISTS lesson_refutations (
+  id         TEXT PRIMARY KEY,
+  lesson_id  TEXT NOT NULL,
+  at         TEXT NOT NULL,
+  reason     TEXT
 );
 CREATE TABLE IF NOT EXISTS approval_stats (
   context_key TEXT NOT NULL,
@@ -86,6 +114,7 @@ export type TaskRow = {
   id: string;
   createdAt: string;
   cwd?: string | null;
+  projectKey?: string | null;
   source: string;
   taskType?: string | null;
   outcome?: string | null;
@@ -95,6 +124,7 @@ export type LessonRow = {
   id: string;
   contextKey: string;
   repoKey?: string | null;
+  projectKey?: string | null;
   lesson: string;
   confidence: number;
   supportCount: number;
@@ -114,6 +144,12 @@ export class Store {
     // columns added after a database was born must be patched in.
     this.ensureColumn("judge_jobs", "duration_ms", "INTEGER");
     this.ensureColumn("lessons", "polarity", "TEXT");
+    this.ensureColumn("lessons", "project_key", "TEXT");
+    this.ensureColumn("tasks", "project_key", "TEXT");
+    this.ensureColumn("tasks", "raw_reward", "REAL");
+    this.ensureColumn("lesson_usage", "arm", "TEXT");
+    // A second writer (the CLI against the app's db) should wait, not throw.
+    this.db.exec("PRAGMA busy_timeout = 5000;");
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -133,14 +169,15 @@ export class Store {
   upsertTask(t: TaskRow): void {
     this.db
       .prepare(
-        `INSERT INTO tasks (id, created_at, cwd, source, task_type, outcome)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO tasks (id, created_at, cwd, project_key, source, task_type, outcome)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            cwd = COALESCE(excluded.cwd, cwd),
+           project_key = COALESCE(excluded.project_key, project_key),
            task_type = COALESCE(excluded.task_type, task_type),
            outcome = COALESCE(excluded.outcome, outcome)`,
       )
-      .run(t.id, t.createdAt, t.cwd ?? null, t.source, t.taskType ?? null, t.outcome ?? null);
+      .run(t.id, t.createdAt, t.cwd ?? null, t.projectKey ?? null, t.source, t.taskType ?? null, t.outcome ?? null);
   }
 
   /** Validates every event; a bad one is dropped with a reason, never fatal.
@@ -185,24 +222,25 @@ export class Store {
   upsertLesson(l: LessonRow): void {
     this.db
       .prepare(
-        `INSERT INTO lessons (id, context_key, repo_key, lesson, confidence, support_count, avg_reward, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `INSERT INTO lessons (id, context_key, repo_key, project_key, lesson, confidence, support_count, avg_reward, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(id) DO UPDATE SET
            context_key = excluded.context_key,
            repo_key = excluded.repo_key,
+           project_key = excluded.project_key,
            lesson = excluded.lesson,
            confidence = excluded.confidence,
            support_count = excluded.support_count,
            avg_reward = excluded.avg_reward`,
       )
-      .run(l.id, l.contextKey, l.repoKey ?? null, l.lesson, l.confidence, l.supportCount, l.avgReward ?? null);
+      .run(l.id, l.contextKey, l.repoKey ?? null, l.projectKey ?? null, l.lesson, l.confidence, l.supportCount, l.avgReward ?? null);
     // Regenerate the FTS row rather than mutate it — same regenerate-don't-
     // mutate rule the ecosystem applies to config.
     this.db.prepare("DELETE FROM lessons_fts WHERE id = ?").run(l.id);
     this.db.prepare("INSERT INTO lessons_fts (lesson, context_key, id) VALUES (?, ?, ?)").run(l.lesson, l.contextKey, l.id);
   }
 
-  searchLessons(query: string, limit: number): (LessonRow & { score: number })[] {
+  searchLessons(query: string, limit: number, projectKey?: string | null): (LessonRow & { score: number })[] {
     // FTS5 MATCH syntax treats punctuation as operators; quote each term.
     const terms = query
       .split(/\s+/)
@@ -211,19 +249,25 @@ export class Store {
       .map((t) => `"${t}"`)
       .join(" OR ");
     if (!terms) return [];
+    // A scoped query sees this project's lessons plus universal advice, and
+    // nothing from anyone else. An unscoped query (the CLI, the report) sees
+    // everything on purpose.
+    const scoped = projectKey !== undefined && projectKey !== null;
     const rows = this.db
       .prepare(
-        `SELECT l.id, l.context_key, l.repo_key, l.lesson, l.confidence, l.support_count, l.avg_reward,
+        `SELECT l.id, l.context_key, l.repo_key, l.project_key, l.lesson, l.confidence, l.support_count, l.avg_reward,
                 bm25(lessons_fts) AS rank
          FROM lessons_fts JOIN lessons l ON l.id = lessons_fts.id
          WHERE lessons_fts MATCH ?
+           AND l.confidence >= ${MIN_RETRIEVAL_CONFIDENCE}${scoped ? " AND (l.project_key IS NULL OR l.project_key = ?)" : ""}
          ORDER BY rank LIMIT ?`,
       )
-      .all(terms, limit) as Record<string, unknown>[];
+      .all(...(scoped ? [terms, projectKey, limit] : [terms, limit])) as Record<string, unknown>[];
     return rows.map((r) => ({
       id: r.id as string,
       contextKey: r.context_key as string,
       repoKey: r.repo_key as string | null,
+      projectKey: r.project_key as string | null,
       lesson: r.lesson as string,
       confidence: r.confidence as number,
       supportCount: r.support_count as number,
@@ -235,16 +279,58 @@ export class Store {
   /** Persist a deterministic score: one reward row per signal, the clamped
    *  total on the task. Replaces any previous deterministic score for the
    *  task — scoring is idempotent, not accumulative. */
-  recordScore(taskId: string, score: { total: number; raw: number; signals: { key: string; value: number; detail?: string }[] }): void {
+  recordScore(
+    taskId: string,
+    score: {
+      total: number;
+      raw: number;
+      signals: { key: string; value: number; detail?: string; eventId?: string }[];
+    },
+  ): void {
     this.db.prepare("DELETE FROM rewards WHERE task_id = ? AND kind = 'deterministic'").run(taskId);
     const insert = this.db.prepare(
       `INSERT INTO rewards (id, task_id, event_id, kind, value, detail, created_at)
-       VALUES (?, ?, NULL, 'deterministic', ?, ?, datetime('now'))`,
+       VALUES (?, ?, ?, 'deterministic', ?, ?, datetime('now'))`,
     );
     score.signals.forEach((s, i) => {
-      insert.run(`${taskId}-det-${i}`, taskId, s.value, s.detail ? `${s.key}: ${s.detail}` : s.key);
+      insert.run(`${taskId}-det-${i}`, taskId, s.eventId ?? null, s.value, s.detail ? `${s.key}: ${s.detail}` : s.key);
     });
-    this.db.prepare("UPDATE tasks SET total_reward = ? WHERE id = ?").run(score.total, taskId);
+    // Both numbers: `total` is what reward math consumes, `raw` is what the
+    // clamp hid. Without raw, 21 tasks reading "1.00" are indistinguishable
+    // whether their unclamped sum was 1.2 or 11.1, and the report cannot see
+    // that the ceiling is where the discrimination went.
+    this.db
+      .prepare("UPDATE tasks SET total_reward = ?, raw_reward = ? WHERE id = ?")
+      .run(score.total, score.raw, taskId);
+  }
+
+  /** The scope a task's lessons belong to, as the client declared it. */
+  /** The unclamped sum, for analysis the clamped total cannot support. */
+  taskRawReward(taskId: string): number | null {
+    const row = this.db.prepare("SELECT raw_reward FROM tasks WHERE id = ?").get(taskId) as
+      | { raw_reward: number | null }
+      | undefined;
+    return row?.raw_reward ?? null;
+  }
+
+  taskProjectKey(taskId: string): string | null {
+    const row = this.db.prepare("SELECT project_key FROM tasks WHERE id = ?").get(taskId) as
+      | { project_key: string | null }
+      | undefined;
+    return row?.project_key ?? null;
+  }
+
+  /** Every reward row for a task, with the event each was attributed to. */
+  rewardsForTask(taskId: string): { kind: string; value: number; detail: string | null; eventId: string | null }[] {
+    const rows = this.db
+      .prepare("SELECT kind, value, detail, event_id FROM rewards WHERE task_id = ? ORDER BY id")
+      .all(taskId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      kind: r.kind as string,
+      value: r.value as number,
+      detail: (r.detail as string | null) ?? null,
+      eventId: (r.event_id as string | null) ?? null,
+    }));
   }
 
   taskReward(taskId: string): number | null {
@@ -263,6 +349,11 @@ export class Store {
   absorbLessons(candidates: CandidateLesson[], taskReward: number): void {
     const read = this.db.prepare("SELECT confidence, support_count, avg_reward FROM lessons WHERE id = ?");
     for (const c of candidates) {
+      // Refused, not sanitized-in-place: the id is a hash of the text, so
+      // rewriting the text here would divorce a row from its identity. The
+      // boundary that produced it is responsible for sanitizing (judge.ts
+      // does), and this catches the call site that forgot.
+      if (lessonIsUnsafe(c.lesson)) continue;
       const row = read.get(c.id) as
         | { confidence: number; support_count: number; avg_reward: number | null }
         | undefined;
@@ -274,6 +365,7 @@ export class Store {
         id: c.id,
         contextKey: c.contextKey,
         repoKey: c.repoKey,
+        projectKey: c.projectKey ?? null,
         lesson: c.lesson,
         confidence: next.confidence,
         supportCount: next.supportCount,
@@ -284,26 +376,196 @@ export class Store {
   }
 
   /** FTS search widened, then re-ranked by confidence/support/repo affinity. */
-  queryLessons(text: string, opts: { repoKey?: string | null; limit?: number }): RankedLesson[] {
+  queryLessons(
+    text: string,
+    opts: { repoKey?: string | null; projectKey?: string | null; limit?: number },
+  ): RankedLesson[] {
     const limit = opts.limit ?? 5;
-    const hits = this.searchLessons(text, Math.max(limit * 4, 20));
-    return rankLessons(hits, { repoKey: opts.repoKey ?? null }).slice(0, limit);
+    const hits = this.searchLessons(text, Math.max(limit * 4, 20), opts.projectKey);
+    return rankLessons(hits, { repoKey: opts.repoKey ?? null, projectKey: opts.projectKey ?? null }).slice(0, limit);
+  }
+
+  /** Every lesson, for the report. */
+  allLessons(): LessonRow[] {
+    const rows = this.db
+      .prepare("SELECT id, context_key, repo_key, project_key, lesson, confidence, support_count, avg_reward FROM lessons ORDER BY id")
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: r.id as string,
+      contextKey: r.context_key as string,
+      repoKey: r.repo_key as string | null,
+      projectKey: r.project_key as string | null,
+      lesson: r.lesson as string,
+      confidence: r.confidence as number,
+      supportCount: r.support_count as number,
+      avgReward: r.avg_reward as number | null,
+    }));
+  }
+
+  /** The arm comparison: for every task that had lessons retrieved, which arm
+   *  it was in and how it went. This is the primary Phase 2 metric — the
+   *  effect of injecting, measured against tasks deliberately withheld,
+   *  rather than inferred from lessons nobody deleted. */
+  armOutcomes(): { arm: string; taskId: string; outcome: string | null; score: number | null }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT u.arm AS arm, u.task_id AS task_id, u.outcome AS outcome, t.total_reward AS score
+         FROM lesson_usage u LEFT JOIN tasks t ON t.id = u.task_id`,
+      )
+      .all() as Record<string, unknown>[];
+    return rows.map((r) => ({
+      arm: (r.arm as string | null) ?? "inject",
+      taskId: r.task_id as string,
+      outcome: (r.outcome as string | null) ?? null,
+      score: (r.score as number | null) ?? null,
+    }));
+  }
+
+  /** How many times a lesson actually rode a prompt (inject), and how many
+   *  times it would have but was deliberately withheld (holdout). */
+  impressionsFor(lessonId: string): { inject: number; holdout: number } {
+    const rows = this.db
+      .prepare("SELECT arm, COUNT(*) AS n FROM lesson_usage WHERE lesson_id = ? GROUP BY arm")
+      .all(lessonId) as { arm: string | null; n: number }[];
+    let inject = 0;
+    let holdout = 0;
+    for (const r of rows) {
+      if (r.arm === "holdout") holdout += r.n;
+      else inject += r.n; // NULL arm = pre-arm rows, which were all injections
+    }
+    return { inject, holdout };
+  }
+
+  /** Trust over the INJECT arm only: a withheld lesson cannot have helped or
+   *  harmed, so counting shadow impressions against it would punish a lesson
+   *  for the control group's existence. */
+  trustFor(lessonId: string): Trust {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                SUM(CASE WHEN outcome = 'positive' THEN 1 ELSE 0 END) AS good
+         FROM lesson_usage
+         WHERE lesson_id = ? AND (arm IS NULL OR arm = 'inject') AND outcome IS NOT NULL`,
+      )
+      .get(lessonId) as { n: number; good: number | null };
+    return trustScore({ successes: row.good ?? 0, impressions: row.n });
+  }
+
+  lessonById(lessonId: string): LessonRow | null {
+    const r = this.db
+      .prepare("SELECT id, context_key, repo_key, project_key, lesson, confidence, support_count, avg_reward FROM lessons WHERE id = ?")
+      .get(lessonId) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      id: r.id as string,
+      contextKey: r.context_key as string,
+      repoKey: r.repo_key as string | null,
+      projectKey: r.project_key as string | null,
+      lesson: r.lesson as string,
+      confidence: r.confidence as number,
+      supportCount: r.support_count as number,
+      avgReward: r.avg_reward as number | null,
+    };
+  }
+
+  /** Staleness, applied as an EVENT rather than as a term in ranking: the
+   *  caller supplies the cutoff, so ranking stays time-independent and every
+   *  test stays deterministic. A lesson not used since `unusedSince` loses a
+   *  fraction of its confidence. */
+  decayUnusedLessons(unusedSince: string, factor: number): number {
+    const f = Math.max(0, Math.min(1, factor));
+    const stale = this.db
+      .prepare(
+        `SELECT l.id FROM lessons l
+         WHERE COALESCE(
+           (SELECT MAX(u.at) FROM lesson_usage u WHERE u.lesson_id = l.id),
+           l.created_at
+         ) < ?`,
+      )
+      .all(unusedSince) as { id: string }[];
+    const update = this.db.prepare("UPDATE lessons SET confidence = confidence * ? WHERE id = ?");
+    for (const row of stale) update.run(f, row.id);
+    return stale.length;
+  }
+
+  /** A lesson was wrong. Lowers confidence hard and records the refutation,
+   *  so a lesson the user rejected stops riding prompts without vanishing
+   *  from the audit trail. The coupling seam for the app's memory_forget. */
+  refuteLesson(lessonId: string, reason?: string | null): { confidence: number } | { error: string } {
+    const row = this.db
+      .prepare("SELECT confidence, support_count, avg_reward FROM lessons WHERE id = ?")
+      .get(lessonId) as { confidence: number; support_count: number; avg_reward: number | null } | undefined;
+    if (!row) return { error: `unknown lesson ${lessonId}` };
+    const next = refute({
+      confidence: row.confidence,
+      supportCount: row.support_count,
+      avgReward: row.avg_reward,
+    });
+    this.db.prepare("UPDATE lessons SET confidence = ? WHERE id = ?").run(next.confidence, lessonId);
+    this.db
+      .prepare(
+        `INSERT INTO lesson_refutations (id, lesson_id, at, reason)
+         VALUES (?, ?, datetime('now'), ?)`,
+      )
+      .run(`${lessonId}:${Date.now()}:${Math.trunc(next.confidence * 1e6)}`, lessonId, reason ?? null);
+    return { confidence: next.confidence };
+  }
+
+  refutationCount(lessonId: string): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS n FROM lesson_refutations WHERE lesson_id = ?")
+      .get(lessonId) as { n: number };
+    return row.n;
+  }
+
+  /** Retrieval WITH an arm. The holdout arm returns nothing — structurally,
+   *  so a buggy client cannot leak the control — but records what it would
+   *  have injected, which is the row that makes the comparison possible.
+   *
+   *  Lessons that have been judged and failed are filtered out here rather
+   *  than merely ranked down: past a point, continuing to spend prompt on
+   *  something measured not to help is just cost. */
+  queryLessonsForTask(
+    text: string,
+    opts: { taskId: string; projectKey?: string | null; holdoutFraction?: number; limit?: number },
+  ): { arm: Arm; lessons: RankedLesson[] } {
+    const arm = armFor(opts.taskId, opts.holdoutFraction ?? 0);
+    const candidates = this.queryLessons(text, {
+      projectKey: opts.projectKey ?? null,
+      limit: opts.limit ?? 5,
+    }).filter((l) => {
+      const t = this.trustFor(l.id);
+      return !t.judged || (t.trust ?? 0) >= HOLDOUT_TRUST_FLOOR;
+    });
+    if (arm === "holdout") {
+      // The shadow impression: this is what the user would have been given.
+      this.recordLessonUse(candidates.map((l) => l.id), opts.taskId, null, "holdout");
+      return { arm, lessons: [] };
+    }
+    return { arm, lessons: candidates };
   }
 
   /** The audit half of injection: which lessons rode which task. */
-  recordLessonUse(lessonIds: string[], taskId: string, turnId?: string | null): void {
+  recordLessonUse(lessonIds: string[], taskId: string, turnId?: string | null, arm: Arm = "inject"): void {
     const insert = this.db.prepare(
-      `INSERT OR IGNORE INTO lesson_usage (id, lesson_id, task_id, turn_id, at, outcome)
-       VALUES (?, ?, ?, ?, datetime('now'), NULL)`,
+      `INSERT OR IGNORE INTO lesson_usage (id, lesson_id, task_id, turn_id, at, arm, outcome)
+       VALUES (?, ?, ?, ?, datetime('now'), ?, NULL)`,
     );
     for (const lessonId of lessonIds) {
-      insert.run(`${taskId}:${lessonId}`, lessonId, taskId, turnId ?? null);
+      insert.run(`${taskId}:${lessonId}`, lessonId, taskId, turnId ?? null, arm);
       this.db.prepare("UPDATE lessons SET last_used_at = datetime('now') WHERE id = ?").run(lessonId);
     }
   }
 
   resolveLessonUse(taskId: string, outcome: string): void {
     this.db.prepare("UPDATE lesson_usage SET outcome = ? WHERE task_id = ? AND outcome IS NULL").run(outcome, taskId);
+  }
+
+  /** The classified form. `outcome` here comes from classifyOutcome, which
+   *  vetoes a success on an interrupt or a declined approval — the two ways
+   *  the user corrects the agent that a score cannot see. */
+  resolveLessonUseWithOutcome(taskId: string, outcome: Outcome): void {
+    this.resolveLessonUse(taskId, outcome);
   }
 
   usageForTask(taskId: string): { lessonId: string; turnId: string | null; outcome: string | null }[] {

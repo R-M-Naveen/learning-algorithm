@@ -11,7 +11,15 @@ import { join } from "node:path";
 import { generateTrajectory } from "../src/synth/generator.ts";
 
 const dbPath = join(mkdtempSync(join(tmpdir(), "learning-conformance-")), "learning.db");
-const proc = spawn(process.execPath, ["--import", "tsx", "src/adapters/stdio.ts"], {
+// By default this drives the dev entry through tsx. Point
+// LEARNING_SIDECAR_ENTRY at dist/sidecar/learning-sidecar.mjs (see
+// `npm run conformance:bundle`) to run the same suite against the artifact
+// that actually ships — the bundle, not the source. A protocol suite that
+// only ever exercises the dev loader cannot tell you the shipped thing works.
+const shippedEntry = process.env.LEARNING_SIDECAR_ENTRY;
+const spawnArgs = shippedEntry ? [shippedEntry] : ["--import", "tsx", "src/adapters/stdio.ts"];
+if (shippedEntry) console.log(`  (driving the shipped bundle: ${shippedEntry})`);
+const proc = spawn(process.execPath, spawnArgs, {
   stdio: ["pipe", "pipe", "inherit"],
 });
 
@@ -85,6 +93,37 @@ const q = await request("lessons/query", { taskText: "fix the failing test", cwd
 const lessons = res(q)?.lessons as { id: string }[];
 check("lessons/query returns ranked lessons", Array.isArray(lessons) && lessons.length > 0);
 notify("lessons/used", { lessonIds: [lessons[0]!.id], taskId: t.task.id, turnId: "turn-x" });
+
+// The other half of the loop: the user rejected what a lesson became, so the
+// lesson loses confidence. A stale id is a result, not a protocol violation.
+const refuted = await request("lessons/refute", { lessonId: lessons[0]!.id, reason: "user deleted the memory" });
+check(
+  "lessons/refute lowers confidence",
+  res(refuted)?.ok === true && (res(refuted)?.confidence as number) > 0,
+);
+const bogus = await request("lessons/refute", { lessonId: "no-such-lesson" });
+check(
+  "refuting an unknown lesson is a result, not an error",
+  res(bogus)?.ok === false && res(bogus)?.reason === "unknown_lesson",
+);
+
+// Pipelining: several requests in flight at once, answered by id rather than
+// by arrival order. The server no longer serializes handling, so this is the
+// property that replaces the old ordering guarantee — and the reason a slow
+// judge call can no longer stall ingestion behind it.
+const pipelined = await Promise.all([
+  request("stats/get", {}),
+  request("health/get", {}),
+  request("queue/status", {}),
+  request("lessons/query", { taskText: "fix the failing test", limit: 1 }),
+  request("stats/get", {}),
+]);
+check(
+  "concurrent in-flight requests are each answered correctly",
+  pipelined.every((r) => r !== undefined && res(r) !== undefined) &&
+    typeof (res(pipelined[1]!)?.db) === "string" &&
+    typeof (res(pipelined[2]!)?.capacity) === "number",
+);
 
 // 5. The governed judge.
 const refused = await request("judge/run", { taskId: t.task.id });
