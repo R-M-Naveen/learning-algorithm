@@ -1,6 +1,12 @@
-// SQLite store on node:sqlite — zero native deps, FTS5 available (verified
-// on the dev machine and required by the Electron 43 packaging spike before
-// app integration). One writer, WAL, write-then-commit discipline.
+// SQLite store on node:sqlite — zero native deps. One writer, WAL,
+// write-then-commit discipline.
+//
+// The Electron packaging spike this comment used to defer is DONE (2026-09-01):
+// the shipped bundle was driven under `ELECTRON_RUN_AS_NODE=1` against
+// Electron 43's own Node, and node:sqlite plus an FTS5 MATCH both work —
+// handshake, a 7-event ingest, the auto-distil reflex, a scoped retrieval and
+// a clean exit. That was the one unknown that could have invalidated this
+// storage choice, so it is worth stating as settled rather than assumed.
 import { DatabaseSync } from "node:sqlite";
 import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { reinforce, rankLessons, type CandidateLesson, type RankedLesson } from "../core/lessons.ts";
