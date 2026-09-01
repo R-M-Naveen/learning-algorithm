@@ -61,7 +61,15 @@ export type DeterministicScore = {
    *  sums from 1.0 to 9.3 — the number was reporting how many turns a task
    *  had, since each clean completion adds +1.0 and the clamp hid the rest.
    *  An average answers the question actually being asked: how well did this
-   *  go, per unit of work. */
+   *  go, per unit of work.
+   *
+   *  Measured over the 35-conversation corpus when this landed: tasks pinned
+   *  at exactly 1.00 fell from 31 to 28, the mean moved 0.82 → 0.77, and the
+   *  distribution gained interior points (0.25, 0.45, 0.68) where before there
+   *  was only a spike at the ceiling and one at the floor. An improvement, not
+   *  a solution: 28 of 35 still sit at the top, because a task whose every
+   *  turn completed cleanly genuinely averages 1.0 — separating those needs a
+   *  signal that is not "did the turn finish". */
   total: number;
   /** Unclamped sum of every signal, kept for analysis. */
   raw: number;
