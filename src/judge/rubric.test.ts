@@ -87,6 +87,7 @@ test("the signals line cannot crowd out the trajectory it is supposed to be chec
   const packet = buildJudgePacket({ id: "t", cwd: "/w", taskType: null }, events, {
     total: 1,
     raw: 15,
+    perTurn: [],
     signals,
   });
 

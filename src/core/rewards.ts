@@ -45,11 +45,28 @@ export type Signal = {
   /** The turn this signal belongs to, when the event named one. */
   turnId?: string | null;
 };
-export type DeterministicScore = {
-  /** Clamped to [-1, 1]; what downstream reward math consumes. */
+export type TurnScore = {
+  turnId: string | null;
+  /** Clamped to [-1, 1] within the turn. */
   total: number;
-  /** Unclamped sum, kept for analysis. */
   raw: number;
+  signals: Signal[];
+};
+
+export type DeterministicScore = {
+  /** Clamped to [-1, 1]; what downstream reward math consumes.
+   *
+   *  The MEAN of the per-turn scores, not the clamped sum of every signal in
+   *  the task. Summing put 31 of 35 real tasks at exactly 1.00 with unclamped
+   *  sums from 1.0 to 9.3 — the number was reporting how many turns a task
+   *  had, since each clean completion adds +1.0 and the clamp hid the rest.
+   *  An average answers the question actually being asked: how well did this
+   *  go, per unit of work. */
+  total: number;
+  /** Unclamped sum of every signal, kept for analysis. */
+  raw: number;
+  /** Per-turn breakdown. The credit assignment the ceiling was hiding. */
+  perTurn: TurnScore[];
   signals: Signal[];
 };
 
@@ -164,5 +181,27 @@ export function scoreTrajectory(events: LearningEvent[]): DeterministicScore {
   }
 
   const raw = signals.reduce((sum, s) => sum + s.value, 0);
-  return { total: Math.max(-1, Math.min(1, raw)), raw, signals };
+
+  // Bucket by turn. Signals with no turn of their own (repeated_failed_command
+  // is a property of the whole trajectory) go in a null bucket so they still
+  // count exactly once rather than being dropped by the bucketing.
+  const buckets = new Map<string | null, Signal[]>();
+  for (const sig of signals) {
+    const key = sig.turnId ?? null;
+    const at = buckets.get(key);
+    if (at) at.push(sig);
+    else buckets.set(key, [sig]);
+  }
+  const perTurn: TurnScore[] = [...buckets.entries()].map(([turnId, sigs]) => {
+    const turnRaw = sigs.reduce((sum, x) => sum + x.value, 0);
+    return { turnId, total: Math.max(-1, Math.min(1, turnRaw)), raw: turnRaw, signals: sigs };
+  });
+
+  // The mean over turns, clamped defensively. A task with no turn boundaries
+  // at all falls back to the old clamped sum, which is the same number it
+  // used to get.
+  const total = perTurn.length
+    ? Math.max(-1, Math.min(1, perTurn.reduce((sum, t) => sum + t.total, 0) / perTurn.length))
+    : Math.max(-1, Math.min(1, raw));
+  return { total, raw, perTurn, signals };
 }
