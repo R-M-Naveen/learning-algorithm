@@ -116,7 +116,7 @@ test("absorbLessons: first sighting inserts, repeat sighting reinforces the same
   const candidate = {
     id: "abc123", contextKey: "failing_test", repoKey: "repo-a",
     lesson: "Never delete or weaken tests to make the suite pass.", polarity: "avoid" as const,
-    projectKey: null,
+    projectKey: null, turnId: null,
   };
   store.absorbLessons([candidate], 0.8);
   store.absorbLessons([candidate], 0.4);
@@ -131,7 +131,7 @@ test("absorbLessons: first sighting inserts, repeat sighting reinforces the same
 test("planted lesson: the topical, same-repo lesson wins the query", () => {
   const store = openStore(":memory:");
   const plant = (id: string, repoKey: string, lesson: string) =>
-    store.absorbLessons([{ id, contextKey: "failing_test", repoKey, projectKey: null, lesson, polarity: "do" as const }], 0.9);
+    store.absorbLessons([{ id, contextKey: "failing_test", repoKey, projectKey: null, turnId: null, lesson, polarity: "do" as const }], 0.9);
   plant("l-target", "webshop", "Reproduce the failing test first, then make a focused edit.");
   plant("l-other-repo", "api-server", "Reproduce the failing test first, then make a focused edit.");
   plant("l-off-topic", "webshop", "Prefer narrow lint runs before committing.");
@@ -143,7 +143,7 @@ test("planted lesson: the topical, same-repo lesson wins the query", () => {
 test("lesson usage: record on injection, resolve when the task ends, last_used_at follows", () => {
   const store = openStore(":memory:");
   store.absorbLessons(
-    [{ id: "l1", contextKey: "k", repoKey: null, projectKey: null, lesson: "reproduce first", polarity: "do" as const }],
+    [{ id: "l1", contextKey: "k", repoKey: null, projectKey: null, turnId: null, lesson: "reproduce first", polarity: "do" as const }],
     0.5,
   );
   store.recordLessonUse(["l1"], "task-9", "turn-1");
@@ -165,11 +165,11 @@ test("a project-scoped lesson never surfaces in another project; global advice s
   const store = openStore(":memory:");
   store.absorbLessons(
     [
-      { id: "scoped-a", contextKey: "general", repoKey: null, projectKey: "/work/api",
+      { id: "scoped-a", contextKey: "general", repoKey: null, projectKey: "/work/api", turnId: null,
         lesson: "The api project pins its migrations by hand.", polarity: "avoid" },
-      { id: "scoped-b", contextKey: "general", repoKey: null, projectKey: "/work/web",
+      { id: "scoped-b", contextKey: "general", repoKey: null, projectKey: "/work/web", turnId: null,
         lesson: "The web project pins its migrations by hand.", polarity: "avoid" },
-      { id: "universal", contextKey: "general", repoKey: null, projectKey: null,
+      { id: "universal", contextKey: "general", repoKey: null, projectKey: null, turnId: null,
         lesson: "Never delete tests to make the suite pass, pins or otherwise.", polarity: "avoid" },
     ],
     1.0,
@@ -187,7 +187,7 @@ test("a project-scoped lesson never surfaces in another project; global advice s
 
 test("a refuted lesson stops being retrieved, and the refutation is on the record", () => {
   const store = openStore(":memory:");
-  const l = { id: "doomed", contextKey: "general", repoKey: null, projectKey: null,
+  const l = { id: "doomed", contextKey: "general", repoKey: null, projectKey: null, turnId: null,
     lesson: "Always run the whole suite before every commit.", polarity: "do" as const };
   store.absorbLessons([l], 1.0);
   assert.equal(store.queryLessons("suite commit", { limit: 5 }).length, 1);
@@ -214,7 +214,7 @@ test("the store refuses a lesson whose text still carries a secret", () => {
   // back out into a prompt.
   const store = openStore(":memory:");
   store.absorbLessons(
-    [{ id: "leaky", contextKey: "general", repoKey: null, projectKey: null,
+    [{ id: "leaky", contextKey: "general", repoKey: null, projectKey: null, turnId: null,
        lesson: "Authenticate with Bearer abcdefghijklmnopqrstuv when deploying.", polarity: "do" as const }],
     1.0,
   );
@@ -249,7 +249,7 @@ test("the holdout arm records a shadow impression and injects nothing", () => {
   // what makes the control comparable: same retrieval, no injection.
   const store = openStore(":memory:");
   store.absorbLessons(
-    [{ id: "l1", contextKey: "general", repoKey: null, projectKey: null,
+    [{ id: "l1", contextKey: "general", repoKey: null, projectKey: null, turnId: null,
        lesson: "Reproduce the failing test first, then edit.", polarity: "do" as const }],
     1.0,
   );
@@ -272,7 +272,7 @@ test("the holdout arm records a shadow impression and injects nothing", () => {
 test("being shown and not helping drives trust down and eventually out of retrieval", () => {
   const store = openStore(":memory:");
   store.absorbLessons(
-    [{ id: "dud", contextKey: "general", repoKey: null, projectKey: null,
+    [{ id: "dud", contextKey: "general", repoKey: null, projectKey: null, turnId: null,
        lesson: "Always reformat the whole file before editing.", polarity: "do" as const }],
     1.0,
   );
@@ -297,7 +297,7 @@ test("decay is an explicit event with a caller-supplied clock, not a term in ran
   // whose `unusedSince` the caller decides, so tests stay deterministic.
   const store = openStore(":memory:");
   store.absorbLessons(
-    [{ id: "stale", contextKey: "general", repoKey: null, projectKey: null,
+    [{ id: "stale", contextKey: "general", repoKey: null, projectKey: null, turnId: null,
        lesson: "The build script lives in tools/build.sh.", polarity: "do" as const }],
     1.0,
   );
@@ -307,5 +307,29 @@ test("decay is an explicit event with a caller-supplied clock, not a term in ran
   assert.ok(store.lessonById("stale")!.confidence < before);
   // Nothing is due when the cutoff predates every lesson.
   assert.equal(store.decayUnusedLessons("1999-01-01T00:00:00.000Z", 0.5), 0);
+  store.close();
+});
+
+test("a lesson reinforces once per TASK, however many turns that task has", () => {
+  // Measured on the live app corpus: one 8-turn session drove a lesson to
+  // support 7 and confidence 0.77 off a SINGLE focused_edit signal, because
+  // the sidecar re-scores and re-distils the whole task on every
+  // turn_completed. Support has to mean "recurred across sessions", or a long
+  // session manufactures a confident lesson on its own.
+  const store = openStore(":memory:");
+  const cand = {
+    id: "l-once", contextKey: "general", repoKey: null, projectKey: null, turnId: "turn-1",
+    lesson: "Keep edits to the few files the task actually needs.", polarity: "do" as const,
+  };
+  for (let i = 0; i < 8; i++) store.absorbLessons([cand], 1.0, "task-A");
+  const afterOneTask = store.lessonById("l-once")!;
+  assert.equal(afterOneTask.supportCount, 1, "eight re-distillations of one task is one sighting");
+
+  store.absorbLessons([{ ...cand, turnId: "turn-9" }], 1.0, "task-B");
+  assert.equal(store.lessonById("l-once")!.supportCount, 2, "a second task is a second sighting");
+
+  // And the provenance is on the record: which task, and which turn in it.
+  const origins = store.lessonOrigins("l-once");
+  assert.deepEqual(origins.map((o) => [o.taskId, o.turnId]).sort(), [["task-A", "turn-1"], ["task-B", "turn-9"]]);
   store.close();
 });

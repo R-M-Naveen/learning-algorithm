@@ -125,6 +125,18 @@ check(
     typeof (res(pipelined[2]!)?.capacity) === "number",
 );
 
+// A judge plan is a printable intention, not a purchase: it must cost nothing
+// and name a reason per pick.
+const plan = await request("judge/plan", { limit: 3, budgetUsd: 1 });
+check(
+  "judge/plan proposes picks with reasons and spends nothing",
+  Array.isArray(res(plan)?.picks) &&
+    (res(plan)?.picks as { reason?: string }[]).every((x) => typeof x.reason === "string" && x.reason.length > 0) &&
+    typeof res(plan)?.estimatedTotalUsd === "number",
+);
+const brokePlan = await request("judge/plan", { limit: 3, budgetUsd: 0 });
+check("a plan with no budget is empty", (res(brokePlan)?.picks as unknown[]).length === 0);
+
 // 5. The governed judge.
 const refused = await request("judge/run", { taskId: t.task.id });
 check("judge/run refused while not idle", res(refused)?.ok === false && res(refused)?.reason === "not_idle");

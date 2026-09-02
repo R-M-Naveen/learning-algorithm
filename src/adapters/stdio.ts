@@ -10,6 +10,7 @@ import { validateEvent, type LearningEvent } from "../core/events.ts";
 import { scoreTrajectory } from "../core/rewards.ts";
 import { distillLessons, repoKeyOf } from "../core/lessons.ts";
 import { classifyOutcome } from "../core/evaluation.ts";
+import { ESTIMATED_JUDGE_COST_USD, selectForJudging } from "../judge/sampling.ts";
 import { MockJudgeBackend, type JudgeBackend, type JudgeMode } from "../judge/backend.ts";
 import { paretoBackendFromEnv } from "../judge/key.ts";
 import { JudgeGovernor, runJudgeGated } from "../judge/governor.ts";
@@ -225,6 +226,22 @@ export class LearningServer {
         }
         return null;
       }
+      // What the sampler WOULD spend on, and why. A plan is printable and
+      // reviewable before any money moves; nothing here runs a judge.
+      case "judge/plan": {
+        const store = this.need();
+        const remaining = Math.max(0, (this.judgeCfg!.monthlyBudgetUsd ?? 0) - this.governor!.spent());
+        const picks = selectForJudging(store.judgeCandidates(), {
+          limit: typeof p.limit === "number" ? p.limit : 5,
+          budgetUsd: typeof p.budgetUsd === "number" ? p.budgetUsd : remaining,
+        });
+        return {
+          picks,
+          candidates: store.judgeCandidates().length,
+          estimatedTotalUsd: Number((picks.length * ESTIMATED_JUDGE_COST_USD).toFixed(4)),
+          budgetRemainingUsd: Number(remaining.toFixed(4)),
+        };
+      }
       case "judge/run": {
         const store = this.need();
         const taskId = String(p.taskId ?? "");
@@ -283,6 +300,7 @@ export class LearningServer {
           score,
         ),
         score.total,
+        taskId,
       );
       // The outcome a lesson is judged by. NOT the raw turn status: an
       // interrupt or a declined approval is the user correcting the agent,

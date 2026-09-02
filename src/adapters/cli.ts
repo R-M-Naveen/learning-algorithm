@@ -12,6 +12,7 @@ import { generateTrajectory, ARCHETYPES, type Archetype } from "../synth/generat
 import { openStore } from "../store/db.ts";
 import { scoreTrajectory } from "../core/rewards.ts";
 import { distillLessons, repoKeyOf } from "../core/lessons.ts";
+import { ESTIMATED_JUDGE_COST_USD, selectForJudging } from "../judge/sampling.ts";
 import { runJudge } from "../judge/judge.ts";
 import { MockJudgeBackend, type JudgeBackend } from "../judge/backend.ts";
 import { ParetoJudgeBackend } from "../judge/pareto.ts";
@@ -97,7 +98,7 @@ async function main(): Promise<number> {
         const cwd = typeof meta?.data.cwd === "string" ? (meta.data.cwd as string) : null;
         const task = { id, createdAt: events[0]!.at, cwd, source: events[0]!.source, taskType: null };
         const candidates = distillLessons(task, events, score);
-        store.absorbLessons(candidates, score.total);
+        store.absorbLessons(candidates, score.total, id);
         absorbed += candidates.length;
         for (const c of candidates) console.log(`  [${c.polarity}] ${c.contextKey}/${c.repoKey ?? "-"}: ${c.lesson}`);
       }
@@ -123,6 +124,19 @@ async function main(): Promise<number> {
         );
       }
       if (!ranked.length) console.log("(no lessons matched — inject nothing)");
+      store.close();
+      return 0;
+    }
+    case "judge-plan": {
+      const store = openStore(dbPath);
+      const picks = selectForJudging(store.judgeCandidates(), {
+        limit: Number(flag(args, "limit") ?? 5),
+        budgetUsd: Number(flag(args, "budget") ?? 0.25),
+      });
+      const candidates = store.judgeCandidates().length;
+      console.log(`${candidates} unjudged task(s); plan spends ~$${(picks.length * ESTIMATED_JUDGE_COST_USD).toFixed(3)}:`);
+      for (const p of picks) console.log(`  ${p.priority.toFixed(2)}  ${p.taskId}  — ${p.reason}`);
+      if (!picks.length) console.log("  (nothing worth judging, or no budget)");
       store.close();
       return 0;
     }
@@ -229,6 +243,7 @@ async function main(): Promise<number> {
         store.absorbLessons(
           distillLessons({ id, createdAt: all[0]!.at, cwd, source: all[0]!.source, taskType: null }, all, score),
           score.total,
+          id,
         );
       }
       console.log(`replayed ${taskIds.size} conversations (${events} events) from ${files.length} files; ${skippedFiles} skipped/empty`);

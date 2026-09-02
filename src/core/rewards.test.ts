@@ -119,3 +119,31 @@ test("signals with no turn of their own still count once, at the task level", ()
   const s = scoreTrajectory([...cmd(1, 1), ...cmd(2, 1), ...cmd(3, 1)]);
   assert.ok(s.signals.some((x) => x.key === "repeated_failed_command"), "the trajectory-level signal survives");
 });
+
+test("a deleted test is caught from the structured field, not from the prose", () => {
+  // The safety rule this module calls structural used to depend on the word
+  // "delet" appearing in a human-written summary, so a producer that sent
+  // deletedFiles without saying so in prose bypassed it.
+  const e: LearningEvent = {
+    id: "fc", taskId: "t", turnId: "turn-1", seq: 1, at: "2026-09-01T00:00:00.000Z",
+    kind: "file_change", source: "app",
+    summary: "src/a.ts", // says nothing about deleting
+    data: { files: ["src/a.ts"], deletedFiles: ["src/a.test.ts"] },
+  };
+  const s = scoreTrajectory([e, {
+    id: "tc", taskId: "t", turnId: "turn-1", seq: 2, at: "2026-09-01T00:00:00.000Z",
+    kind: "turn_completed", source: "app", summary: "done", data: { status: "completed" },
+  }]);
+  assert.ok(s.signals.some((x) => x.key === "test_deletion"), JSON.stringify(s.signals.map((x) => x.key)));
+  assert.ok(s.signals.some((x) => x.key === "turn_completed_tainted"), "and the completion earns nothing");
+});
+
+test("deleting a non-test file is not a test deletion", () => {
+  const e: LearningEvent = {
+    id: "fc", taskId: "t", turnId: "turn-1", seq: 1, at: "2026-09-01T00:00:00.000Z",
+    kind: "file_change", source: "app", summary: "removed a stale script",
+    data: { files: ["scripts/old.mjs"], deletedFiles: ["scripts/old.mjs"] },
+  };
+  const s = scoreTrajectory([e]);
+  assert.ok(!s.signals.some((x) => x.key === "test_deletion"), JSON.stringify(s.signals.map((x) => x.key)));
+});
