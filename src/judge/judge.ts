@@ -61,6 +61,7 @@ export async function runJudge(store: Store, taskId: string, backend: JudgeBacke
         };
       }),
       normalized,
+      taskId,
     );
   }
   return { taskId, normalized, verdicts, lessonsAbsorbed: parsed.lessons.length, costUsd: raw.costUsd };

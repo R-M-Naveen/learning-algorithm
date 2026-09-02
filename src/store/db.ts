@@ -93,6 +93,13 @@ CREATE TABLE IF NOT EXISTS lesson_usage (
 );
 CREATE INDEX IF NOT EXISTS lesson_usage_lesson ON lesson_usage (lesson_id);
 CREATE INDEX IF NOT EXISTS lesson_usage_task ON lesson_usage (task_id);
+CREATE TABLE IF NOT EXISTS lesson_origins (
+  lesson_id  TEXT NOT NULL,
+  task_id    TEXT NOT NULL,
+  turn_id    TEXT,
+  at         TEXT NOT NULL,
+  PRIMARY KEY (lesson_id, task_id)      -- one sighting per task, by construction
+);
 CREATE TABLE IF NOT EXISTS lesson_refutations (
   id         TEXT PRIMARY KEY,
   lesson_id  TEXT NOT NULL,
@@ -346,11 +353,30 @@ export class Store {
     return (this.db.prepare("SELECT id FROM tasks ORDER BY created_at").all() as { id: string }[]).map((r) => r.id);
   }
 
-  /** Insert-or-reinforce each candidate: a lesson seen again gains support
-   *  and confidence instead of a duplicate row (ids collide by design). */
-  absorbLessons(candidates: CandidateLesson[], taskReward: number): void {
+  /** Insert-or-reinforce each candidate: a lesson seen again gains support and
+   *  confidence instead of a duplicate row (ids collide by design).
+   *
+   *  `taskId` makes reinforcement idempotent PER TASK. The sidecar re-scores
+   *  and re-distils a whole task on every turn_completed, so without this one
+   *  8-turn session drove a lesson to support 7 and confidence 0.77 off a
+   *  single focused_edit — support measured session length rather than
+   *  recurrence across sessions, and both ranking and confidence read it.
+   *  Omitting taskId keeps the old behaviour for callers that have no task
+   *  (tests, ad-hoc distillation). */
+  absorbLessons(candidates: CandidateLesson[], taskReward: number, taskId?: string): void {
     const read = this.db.prepare("SELECT confidence, support_count, avg_reward FROM lessons WHERE id = ?");
+    const claim = this.db.prepare(
+      `INSERT OR IGNORE INTO lesson_origins (lesson_id, task_id, turn_id, at)
+       VALUES (?, ?, ?, datetime('now'))`,
+    );
     for (const c of candidates) {
+      // Claim the (lesson, task) pair first. A row that already existed means
+      // this task has already contributed its one sighting, so the lesson is
+      // left exactly as it is.
+      if (taskId) {
+        const claimed = claim.run(c.id, taskId, c.turnId ?? null);
+        if (Number(claimed.changes ?? 0) === 0) continue;
+      }
       // Refused, not sanitized-in-place: the id is a hash of the text, so
       // rewriting the text here would divorce a row from its identity. The
       // boundary that produced it is responsible for sanitizing (judge.ts
@@ -547,6 +573,19 @@ export class Store {
       )
       .run(`${lessonId}:${Date.now()}:${Math.trunc(next.confidence * 1e6)}`, lessonId, reason ?? null);
     return { confidence: next.confidence };
+  }
+
+  /** Which task, and which turn in it, produced this lesson. */
+  lessonOrigins(lessonId: string): { taskId: string; turnId: string | null; at: string }[] {
+    return (
+      this.db
+        .prepare("SELECT task_id, turn_id, at FROM lesson_origins WHERE lesson_id = ? ORDER BY at")
+        .all(lessonId) as Record<string, unknown>[]
+    ).map((r) => ({
+      taskId: r.task_id as string,
+      turnId: (r.turn_id as string | null) ?? null,
+      at: r.at as string,
+    }));
   }
 
   refutationCount(lessonId: string): number {

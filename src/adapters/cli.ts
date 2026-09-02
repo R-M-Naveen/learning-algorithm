@@ -98,7 +98,7 @@ async function main(): Promise<number> {
         const cwd = typeof meta?.data.cwd === "string" ? (meta.data.cwd as string) : null;
         const task = { id, createdAt: events[0]!.at, cwd, source: events[0]!.source, taskType: null };
         const candidates = distillLessons(task, events, score);
-        store.absorbLessons(candidates, score.total);
+        store.absorbLessons(candidates, score.total, id);
         absorbed += candidates.length;
         for (const c of candidates) console.log(`  [${c.polarity}] ${c.contextKey}/${c.repoKey ?? "-"}: ${c.lesson}`);
       }
@@ -243,6 +243,7 @@ async function main(): Promise<number> {
         store.absorbLessons(
           distillLessons({ id, createdAt: all[0]!.at, cwd, source: all[0]!.source, taskType: null }, all, score),
           score.total,
+          id,
         );
       }
       console.log(`replayed ${taskIds.size} conversations (${events} events) from ${files.length} files; ${skippedFiles} skipped/empty`);

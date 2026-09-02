@@ -300,6 +300,7 @@ export class LearningServer {
           score,
         ),
         score.total,
+        taskId,
       );
       // The outcome a lesson is judged by. NOT the raw turn status: an
       // interrupt or a declined approval is the user correcting the agent,

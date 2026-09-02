@@ -309,3 +309,27 @@ test("decay is an explicit event with a caller-supplied clock, not a term in ran
   assert.equal(store.decayUnusedLessons("1999-01-01T00:00:00.000Z", 0.5), 0);
   store.close();
 });
+
+test("a lesson reinforces once per TASK, however many turns that task has", () => {
+  // Measured on the live app corpus: one 8-turn session drove a lesson to
+  // support 7 and confidence 0.77 off a SINGLE focused_edit signal, because
+  // the sidecar re-scores and re-distils the whole task on every
+  // turn_completed. Support has to mean "recurred across sessions", or a long
+  // session manufactures a confident lesson on its own.
+  const store = openStore(":memory:");
+  const cand = {
+    id: "l-once", contextKey: "general", repoKey: null, projectKey: null, turnId: "turn-1",
+    lesson: "Keep edits to the few files the task actually needs.", polarity: "do" as const,
+  };
+  for (let i = 0; i < 8; i++) store.absorbLessons([cand], 1.0, "task-A");
+  const afterOneTask = store.lessonById("l-once")!;
+  assert.equal(afterOneTask.supportCount, 1, "eight re-distillations of one task is one sighting");
+
+  store.absorbLessons([{ ...cand, turnId: "turn-9" }], 1.0, "task-B");
+  assert.equal(store.lessonById("l-once")!.supportCount, 2, "a second task is a second sighting");
+
+  // And the provenance is on the record: which task, and which turn in it.
+  const origins = store.lessonOrigins("l-once");
+  assert.deepEqual(origins.map((o) => [o.taskId, o.turnId]).sort(), [["task-A", "turn-1"], ["task-B", "turn-9"]]);
+  store.close();
+});
